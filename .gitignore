@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+venv/
+.venv/
+env/
+.env
+
+# Training artefacts
+laptop/data/images/
+laptop/data/*.csv
+laptop/models/*.pt
+laptop/models/*.onnx
+laptop/models/tb_*/
+laptop/models/splits/
+laptop/models/*.png
+laptop/models/*.json
+laptop/logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
