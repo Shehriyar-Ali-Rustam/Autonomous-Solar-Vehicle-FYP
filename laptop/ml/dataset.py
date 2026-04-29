@@ -54,7 +54,8 @@ def flip_sensors(sensors: dict) -> dict:
 
 
 def build_state_vector(sensors: dict, gps_valid: int, gps_speed: float,
-                       gps_heading_deg: float, prev_action: int) -> np.ndarray:
+                       gps_heading_deg: float, prev_action: int,
+                       yolo: dict = None) -> np.ndarray:
     """
     Build normalized state vector for the model.
 
@@ -62,6 +63,7 @@ def build_state_vector(sensors: dict, gps_valid: int, gps_speed: float,
       [FL/max, FR/max, FW/max, BC/max, LS/max, RS/max,
        front_min/max, back_min/max,
        gps_valid, gps_speed/max, gps_heading_rad/(2*pi),
+       yolo_person, yolo_object, yolo_area_ratio, yolo_position/2,
        prev_action_onehot x NUM_ACTIONS]
     """
     u = [sensors['FL'], sensors['FR'], sensors['FW'],
@@ -75,12 +77,22 @@ def build_state_vector(sensors: dict, gps_valid: int, gps_speed: float,
     gps_speed_n = max(0.0, min(MAX_SPEED_MPS, gps_speed)) / MAX_SPEED_MPS
     heading_rad = math.radians(gps_heading_deg % 360.0) / (2 * math.pi)
 
+    # YOLO features (default zeros if not provided)
+    if yolo is None:
+        yolo = {}
+    yolo_person = float(yolo.get('person_detected', 0))
+    yolo_obj    = float(yolo.get('object_detected', 0))
+    yolo_area   = float(yolo.get('nearest_area_ratio', 0.0))
+    yolo_pos    = float(yolo.get('nearest_position', 1)) / 2.0  # normalize 0/1/2 → 0/0.5/1
+
     prev_oh = np.zeros(NUM_ACTIONS, dtype=np.float32)
     if 0 <= prev_action < NUM_ACTIONS:
         prev_oh[prev_action] = 1.0
 
     vec = np.array(u + [front_min, back_min, float(gps_valid),
-                        gps_speed_n, heading_rad], dtype=np.float32)
+                        gps_speed_n, heading_rad,
+                        yolo_person, yolo_obj, yolo_area, yolo_pos],
+                   dtype=np.float32)
     return np.concatenate([vec, prev_oh])
 
 
@@ -112,6 +124,7 @@ class Sample:
     gps_heading: float
     prev_action: int
     label: int
+    yolo: dict
 
 
 class DrivingDataset(Dataset):
@@ -145,6 +158,12 @@ class DrivingDataset(Dataset):
                 gps_heading=float(r.get('gps_heading', 0.0)),
                 prev_action=int(r.get('prev_action', STOP)),
                 label=int(r['action_label']),
+                yolo={
+                    'person_detected':    int(r.get('yolo_person', 0)),
+                    'object_detected':    int(r.get('yolo_object', 0)),
+                    'nearest_area_ratio': float(r.get('yolo_area', 0.0)),
+                    'nearest_position':   int(r.get('yolo_pos', 1)),
+                },
             ))
         return samples
 
@@ -158,6 +177,7 @@ class DrivingDataset(Dataset):
         sensors = s.sensors
         label = s.label
         prev_action = s.prev_action
+        yolo = dict(s.yolo)
 
         # Horizontal flip augmentation
         flip = self.train and random.random() < self.flip_prob
@@ -166,12 +186,14 @@ class DrivingDataset(Dataset):
             sensors = flip_sensors(sensors)
             label = FLIP_ACTION_MAP[label]
             prev_action = FLIP_ACTION_MAP[prev_action]
+            # Flip YOLO position too (left ↔ right)
+            yolo['nearest_position'] = 2 - yolo.get('nearest_position', 1)
 
         img_t = self.transform(img)
 
         # Sensor noise augmentation (on normalized state vector)
         state = build_state_vector(sensors, s.gps_valid, s.gps_speed,
-                                   s.gps_heading, prev_action)
+                                   s.gps_heading, prev_action, yolo)
         if self.train and self.sensor_noise_std > 0:
             # Only add noise to the first 8 features (distances); keep one-hot crisp
             noise = np.random.normal(0, self.sensor_noise_std, 8).astype(np.float32)

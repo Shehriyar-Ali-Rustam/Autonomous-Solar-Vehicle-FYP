@@ -28,12 +28,55 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from vision.camera import Camera
 from ml.actions import manual_to_action, ACTION_NAMES, STOP
 
+# YOLO is optional (heavy import) — only enabled if available
+try:
+    from vision.object_detector import ObjectDetector
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+
 app = Flask(__name__)
 
 # Global state
 pi_client = None
 camera = None
 recorder = None
+yolo = None
+yolo_lock = threading.Lock()
+latest_yolo = {'person_detected': 0, 'object_detected': 0,
+               'nearest_area_ratio': 0.0, 'nearest_position': 1,
+               'num_objects': 0}
+
+
+def yolo_loop():
+    """Background thread: runs YOLO at ~5Hz on latest camera frame."""
+    global latest_yolo
+    while True:
+        if camera is None or yolo is None:
+            time.sleep(0.5)
+            continue
+        frame, _ = camera.read()
+        if frame is None:
+            time.sleep(0.1)
+            continue
+        try:
+            features = yolo.extract_features(frame)
+            with yolo_lock:
+                latest_yolo = {
+                    'person_detected':    features.person_detected,
+                    'object_detected':    features.object_detected,
+                    'nearest_area_ratio': features.nearest_area_ratio,
+                    'nearest_position':   features.nearest_position,
+                    'num_objects':        features.num_objects,
+                }
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+
+def get_yolo_snapshot():
+    with yolo_lock:
+        return dict(latest_yolo)
 
 
 class PiClient:
@@ -153,6 +196,7 @@ class DataRecorder:
                 'gps_valid', 'gps_speed', 'gps_heading',
                 'drive', 'steer', 'speed',
                 'prev_action', 'action_label', 'action_name',
+                'yolo_person', 'yolo_object', 'yolo_area', 'yolo_pos', 'yolo_count',
             ])
         # Count existing samples
         try:
@@ -195,10 +239,12 @@ class DataRecorder:
             dists = status.get('distances', {})
             gps = status.get('gps', {}) if status else {}
 
-            action_id = manual_to_action(drive, steer)
+            action_id = manual_to_action(drive, steer, speed)
             frame_name = f"{self.session_id}_{uuid.uuid4().hex[:8]}.jpg"
             frame_path = os.path.join(self.images_dir, frame_name)
             cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+            yolo_snap = get_yolo_snapshot()
 
             self.csv_writer.writerow([
                 self.session_id, time.time(), frame_path,
@@ -207,12 +253,15 @@ class DataRecorder:
                 int(gps.get('valid', 0)), gps.get('speed_mps', 0.0), gps.get('heading_deg', 0.0),
                 drive, steer, speed,
                 self.prev_action, action_id, ACTION_NAMES[action_id],
+                yolo_snap['person_detected'], yolo_snap['object_detected'],
+                yolo_snap['nearest_area_ratio'], yolo_snap['nearest_position'],
+                yolo_snap['num_objects'],
             ])
             self.csv_file.flush()
             self.prev_action = action_id
             self.samples_written += 1
 
-            time.sleep(0.2)  # 5 Hz
+            time.sleep(0.1)  # 10 Hz
 
     def close(self):
         self.running = False
@@ -324,6 +373,9 @@ body {
 <div class="cmd-display">
     <span id="cmdDrive">STOP</span> | <span id="cmdSteer">STRAIGHT</span>
 </div>
+<div class="cmd-display" id="yoloInfo" style="font-size:14px;color:#888;">
+    YOLO: <span id="yoloStatus">--</span>
+</div>
 
 <div class="sensor-bar">
     <div class="sensor"><div class="label">Front-L</div><div class="value" id="sFL">--</div><div class="unit">cm</div></div>
@@ -342,7 +394,7 @@ body {
     <div class="dpad">
         <div></div>
         <div class="btn" id="btnW" data-drive="BACKWARD">FWD</div>
-        <div></div>
+        <div class="btn" id="btnX" data-steer="STEER_STOP">STRAIGHT</div>
         <div class="btn" id="btnA" data-steer="LEFT">LEFT</div>
         <div class="btn stop-btn" id="btnStop" data-drive="STOP" data-steer="STEER_STOP">STOP</div>
         <div class="btn" id="btnD" data-steer="RIGHT">RIGHT</div>
@@ -377,7 +429,13 @@ function sendCmd(drive, steer, speed) {
     fetch('/cmd?' + params.toString()).catch(() => {});
 }
 
-// D-pad buttons - ONE TAP = keep moving, STOP to stop
+// D-pad buttons:
+//   FWD/REV → tap to keep moving (latch)
+//   LEFT/RIGHT → tap for brief turn (~600ms) then auto-straighten
+//   STOP → resets everything
+const STEER_PULSE_MS = 200;  // how long LEFT/RIGHT stays active per tap
+let steerTimer = null;
+
 document.querySelectorAll('.btn').forEach(btn => {
     const drive = btn.dataset.drive || null;
     const steer = btn.dataset.steer || null;
@@ -387,19 +445,37 @@ document.querySelectorAll('.btn').forEach(btn => {
         document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         sendCmd(drive, steer);
+
+        // Brief-turn behavior: after a steer LEFT/RIGHT tap,
+        // auto-send STEER_STOP after STEER_PULSE_MS.
+        if (steerTimer) { clearTimeout(steerTimer); steerTimer = null; }
+        if (steer === 'LEFT' || steer === 'RIGHT') {
+            steerTimer = setTimeout(() => {
+                sendCmd(null, 'STEER_STOP');
+                btn.classList.remove('active');
+                steerTimer = null;
+            }, STEER_PULSE_MS);
+        }
     }
 
     btn.addEventListener('click', tap);
     btn.addEventListener('touchstart', tap, {passive:false});
 });
 
-// Keyboard controls
+// Keyboard controls - W/S latch drive, A/D pulse steer briefly
 const keyMap = {w:'BACKWARD', s:'FORWARD'};
 const steerMap = {a:'LEFT', d:'RIGHT'};
 document.addEventListener('keydown', e => {
     const k = e.key.toLowerCase();
     if (keyMap[k]) sendCmd(keyMap[k], null);
-    else if (steerMap[k]) sendCmd(null, steerMap[k]);
+    else if (steerMap[k]) {
+        sendCmd(null, steerMap[k]);
+        if (steerTimer) clearTimeout(steerTimer);
+        steerTimer = setTimeout(() => {
+            sendCmd(null, 'STEER_STOP');
+            steerTimer = null;
+        }, STEER_PULSE_MS);
+    }
     else if (k === ' ') { e.preventDefault(); sendCmd('STOP', 'STEER_STOP'); }
     else if (k === 'x') sendCmd(null, 'STEER_STOP');
     else if (k === 'r') toggleRec();
@@ -480,6 +556,18 @@ function pollStatus() {
 
         // Update recording status
         updateRecUI(s.recording, s.samples);
+
+        // YOLO info
+        if (s.yolo) {
+            const y = s.yolo;
+            const posTxt = ['LEFT','CENTER','RIGHT'][y.nearest_position] || '-';
+            let txt = `objects=${y.num_objects}`;
+            if (y.person_detected) txt = '⚠ PERSON ' + posTxt + ' | ' + txt;
+            else if (y.object_detected) txt = `obj at ${posTxt} | ` + txt;
+            document.getElementById('yoloStatus').textContent = txt;
+            const yEl = document.getElementById('yoloInfo');
+            yEl.style.color = y.person_detected ? '#f44' : '#888';
+        }
     }).catch(() => {});
 }
 setInterval(pollStatus, 300);
@@ -530,6 +618,7 @@ def status():
         min_back=st.get('min_distance_back', 0),
         recording=recorder.is_recording() if recorder else False,
         samples=recorder.samples_written if recorder else 0,
+        yolo=get_yolo_snapshot(),
     )
 
 
@@ -563,7 +652,7 @@ def video_feed():
 
 
 def main():
-    global pi_client, camera, recorder
+    global pi_client, camera, recorder, yolo
 
     p = argparse.ArgumentParser()
     p.add_argument('--pi', required=True, help='Pi IP address')
@@ -571,6 +660,7 @@ def main():
     p.add_argument('--camera', type=int, default=0, help='Camera device index')
     p.add_argument('--data-dir', default=os.path.join(os.path.dirname(__file__), 'data'),
                    help='Data output directory')
+    p.add_argument('--no-yolo', action='store_true', help='Disable YOLO detection')
     args = p.parse_args()
 
     # Start camera
@@ -587,16 +677,30 @@ def main():
         return
     pi_client.start()
 
+    # Start YOLO (background thread, ~5Hz)
+    if YOLO_AVAILABLE and not args.no_yolo:
+        try:
+            print("[YOLO] Loading model (first run downloads ~6MB)...")
+            yolo = ObjectDetector(conf_threshold=0.4, device='cpu')
+            threading.Thread(target=yolo_loop, daemon=True).start()
+            print("[YOLO] Started")
+        except Exception as e:
+            print(f"[YOLO] Failed to start: {e}")
+            yolo = None
+    else:
+        print("[YOLO] Disabled")
+
     # Start recorder
     recorder = DataRecorder(args.data_dir)
     threading.Thread(target=recorder.record_loop, daemon=True).start()
 
     print("=" * 55)
-    print("  WEB VEHICLE CONTROL + RECORDER")
+    print("  WEB VEHICLE CONTROL + RECORDER + YOLO")
     print("=" * 55)
     print(f"  Open in browser: http://0.0.0.0:{args.port}")
     print(f"  Pi: {args.pi}")
     print(f"  Camera: device {args.camera}")
+    print(f"  YOLO: {'ON' if yolo else 'OFF'}")
     print(f"  Data: {args.data_dir}")
     print(f"  Existing samples: {recorder.samples_written}")
     print("=" * 55)

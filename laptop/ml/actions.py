@@ -16,33 +16,62 @@ ACTION_NAMES = [
 ]
 NUM_ACTIONS = len(ACTION_NAMES)
 
+# True if the car's motor wiring is reversed (so drive='BACKWARD' protocol cmd
+# makes the car physically go forward, and vice versa). Both labeling and
+# autonomous-mode command mapping account for this.
+DRIVE_INVERTED = True
+
 
 def action_to_pi_command(action_id: int) -> dict:
-    """Map action id -> Pi TCP command dict."""
+    """Map action id -> Pi TCP command dict (physical direction)."""
+    fwd_cmd = 'BACKWARD' if DRIVE_INVERTED else 'FORWARD'
+    rev_cmd = 'FORWARD' if DRIVE_INVERTED else 'BACKWARD'
     m = {
-        FORWARD:       {'command': 'FORWARD',  'steer': 'STEER_STOP', 'speed': 60},
-        SLOW_DOWN:     {'command': 'FORWARD',  'steer': 'STEER_STOP', 'speed': 30},
-        TURN_LEFT:     {'command': 'FORWARD',  'steer': 'LEFT',       'speed': 40},
-        TURN_RIGHT:    {'command': 'FORWARD',  'steer': 'RIGHT',      'speed': 40},
-        STOP:          {'command': 'STOP',     'steer': 'STEER_STOP', 'speed': 0},
-        REVERSE_LEFT:  {'command': 'BACKWARD', 'steer': 'LEFT',       'speed': 35},
-        REVERSE_RIGHT: {'command': 'BACKWARD', 'steer': 'RIGHT',      'speed': 35},
-        REVERSE:       {'command': 'BACKWARD', 'steer': 'STEER_STOP', 'speed': 35},
+        FORWARD:       {'command': fwd_cmd, 'steer': 'STEER_STOP', 'speed': 60},
+        SLOW_DOWN:     {'command': fwd_cmd, 'steer': 'STEER_STOP', 'speed': 30},
+        TURN_LEFT:     {'command': fwd_cmd, 'steer': 'LEFT',       'speed': 40},
+        TURN_RIGHT:    {'command': fwd_cmd, 'steer': 'RIGHT',      'speed': 40},
+        STOP:          {'command': 'STOP',  'steer': 'STEER_STOP', 'speed': 0},
+        REVERSE_LEFT:  {'command': rev_cmd, 'steer': 'LEFT',       'speed': 35},
+        REVERSE_RIGHT: {'command': rev_cmd, 'steer': 'RIGHT',      'speed': 35},
+        REVERSE:       {'command': rev_cmd, 'steer': 'STEER_STOP', 'speed': 35},
     }
     return m.get(action_id, m[STOP])
 
 
-def manual_to_action(drive: str, steer: str) -> int:
-    """Convert manual WASD drive+steer -> action id (used when labeling training data)."""
+SLOW_DOWN_SPEED_THRESHOLD = 35  # speed < this while moving forward → SLOW_DOWN
+
+
+def manual_to_action(drive: str, steer: str, speed: int = 50) -> int:
+    """Convert manual drive+steer -> action id (used when labeling training data).
+    Accounts for DRIVE_INVERTED: protocol drive='BACKWARD' = physical FORWARD.
+
+    Intent-based labeling:
+        - STOP + steer=LEFT/RIGHT → TURN_LEFT/TURN_RIGHT (user wants to turn)
+        - Forward at low speed → SLOW_DOWN
+    """
+    # Determine physical direction
+    physical_forward = (drive == 'BACKWARD') if DRIVE_INVERTED else (drive == 'FORWARD')
+    physical_backward = (drive == 'FORWARD') if DRIVE_INVERTED else (drive == 'BACKWARD')
+
+    # STOP + steer captures turn intent
     if drive == 'STOP':
-        return STOP
-    if drive == 'FORWARD':
         if steer == 'LEFT':
             return TURN_LEFT
         if steer == 'RIGHT':
             return TURN_RIGHT
+        return STOP
+
+    if physical_forward:
+        if steer == 'LEFT':
+            return TURN_LEFT
+        if steer == 'RIGHT':
+            return TURN_RIGHT
+        # Low speed forward = SLOW_DOWN
+        if 0 < speed < SLOW_DOWN_SPEED_THRESHOLD:
+            return SLOW_DOWN
         return FORWARD
-    if drive == 'BACKWARD':
+    if physical_backward:
         if steer == 'LEFT':
             return REVERSE_LEFT
         if steer == 'RIGHT':

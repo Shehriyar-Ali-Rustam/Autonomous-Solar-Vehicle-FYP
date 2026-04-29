@@ -86,15 +86,19 @@ class Predictor:
         print(f"[Predictor] loaded {self.kind} model: {model_path}")
 
     def predict(self, frame_bgr, sensors: dict, gps_valid: int, gps_speed: float,
-                gps_heading_deg: float, prev_action: int) -> dict:
-        """Returns dict with action_id, action_name, probs, confidence."""
+                gps_heading_deg: float, prev_action: int, yolo: dict = None) -> dict:
+        """Returns dict with action_id, action_name, probs, confidence.
+
+        yolo: optional dict with keys person_detected, object_detected,
+              nearest_area_ratio, nearest_position. If None, defaults to zeros.
+        """
         if frame_bgr is None:
             return {'action_id': STOP, 'action_name': ACTION_NAMES[STOP],
                     'probs': None, 'confidence': 0.0, 'reason': 'no_frame'}
 
         img = _preprocess_image(frame_bgr)
         state = build_state_vector(sensors, gps_valid, gps_speed,
-                                   gps_heading_deg, prev_action)
+                                   gps_heading_deg, prev_action, yolo)
         state = state[np.newaxis, :]  # (1, state_dim)
 
         logits = self.backend.predict_logits(img, state)[0]

@@ -20,9 +20,14 @@ import torchvision.models as tvm
 
 from .actions import NUM_ACTIONS
 
-# State vector size: 6 ultrasonic (FL,FR,FW,BC,LS,RS) + 2 mins
-# + 2 gps (speed, heading_sin_cos) + 8 prev_action one-hot = 18 -> we use 19 with front_min/back_min separately
-STATE_DIM = 6 + 2 + 3 + NUM_ACTIONS  # 6 sensors + 2 mins + 3 gps (valid, speed, heading_rad) + 8 prev-onehot
+# State vector layout:
+# - 6 ultrasonic (FL, FR, FW, BC, LS, RS)
+# - 2 mins (front_min, back_min)
+# - 3 GPS (valid, speed, heading_rad)
+# - 4 YOLO features (person_detected, object_detected, nearest_area_ratio, nearest_position)
+# - 8 prev_action one-hot
+YOLO_FEATURES = 4
+STATE_DIM = 6 + 2 + 3 + YOLO_FEATURES + NUM_ACTIONS
 
 
 def make_backbone(pretrained: bool = True):
