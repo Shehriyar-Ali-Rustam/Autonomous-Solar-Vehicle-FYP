@@ -57,6 +57,15 @@ yolo:
   conf_threshold: 0.4
   staleness_seconds: 1.0    # if YOLO heartbeat older than this → treat as failed
 
+# ===== Hybrid (sensor + YOLO rules) controller ===============================
+# Used by autonomous_hybrid.py. No ML model required.
+hybrid:
+  front_emergency_cm: 35    # any front sensor below this → reverse out
+  front_slow_cm: 90         # below this → turn toward clearer side / slow down
+  front_cruise_cm: 150      # at or above this → full forward
+  side_clear_cm: 40         # need at least this much side clearance to turn that way
+  back_emergency_cm: 30     # block reverse when back sensor below this
+
 # ===== Logging ===============================================================
 logging:
   level: "INFO"             # DEBUG | INFO | WARNING | ERROR

@@ -259,17 +259,24 @@ def sample_weights_for_oversampling(labels: List[int],
     return np.array([inv[c] for c in labels], dtype=np.float64)
 
 
-# ---------------- Per-session, stratified split ----------------
+# ---------------- Splits ----------------
 def split_csv(csv_path: str, out_dir: str,
               train_ratio: float = 0.70, val_ratio: float = 0.15,
-              seed: int = 42, min_per_class_per_split: int = 2) -> dict:
-    """Split a dataset CSV with two priorities, in order:
+              seed: int = 42, min_per_class_per_split: int = 2,
+              mode: str = 'time') -> dict:
+    """Split a dataset CSV.
 
-    1. **No scene leakage**: rows from the same `session` MUST end up in the
-       same split (train OR val OR test, never split across).
-    2. **Stratification**: every action class should appear in val + test
-       at least `min_per_class_per_split` times where data permits, even
-       if that means moving a few sessions to balance.
+    Modes:
+      'time'    (default) — within each session, sort by timestamp and take
+                first `train_ratio` as train, next `val_ratio` as val, rest
+                as test. A small temporal buffer (1% of the session length on
+                each side of a split boundary) is dropped to reduce
+                near-frame leakage between splits. Recommended when you only
+                have a handful of sessions; gives every class plenty of
+                support in every split while still avoiding random shuffle
+                leakage.
+      'session' — entire sessions go into one bucket (no scene leakage at
+                all but unbalanced if you have <5 sessions).
 
     Returns a dict {'train': path, 'val': path, 'test': path}.
     """
@@ -277,6 +284,10 @@ def split_csv(csv_path: str, out_dir: str,
     rng = random.Random(seed)
 
     df = pd.read_csv(csv_path)
+    if 'session' in df.columns and mode == 'time':
+        return _split_time_within_sessions(df, out_dir, train_ratio,
+                                           val_ratio, min_per_class_per_split)
+
     if 'session' not in df.columns:
         # Fall back to random split if no session column
         df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
@@ -350,6 +361,60 @@ def split_csv(csv_path: str, out_dir: str,
         val_df['session'].nunique()   if 'session' in val_df   else '?',
         test_df['session'].nunique()  if 'session' in test_df  else '?',
     ))
+    return paths
+
+
+def _split_time_within_sessions(df: pd.DataFrame, out_dir: str,
+                                train_ratio: float, val_ratio: float,
+                                min_per_class_per_split: int,
+                                buffer_frac: float = 0.01) -> dict:
+    """For each session, sort by timestamp and take first/middle/last slices.
+
+    Adjacent frames are nearly identical (10Hz sampling), so we drop a small
+    buffer (1% of session length) at each split boundary to reduce direct
+    leakage between train and test.
+    """
+    train_parts, val_parts, test_parts = [], [], []
+    for sess, sub in df.groupby('session'):
+        sub = sub.sort_values('timestamp').reset_index(drop=True)
+        n = len(sub)
+        if n < 10:
+            # too small to split meaningfully — put it all in train
+            train_parts.append(sub); continue
+
+        n_train = int(n * train_ratio)
+        n_val   = int(n * val_ratio)
+        buf = max(1, int(n * buffer_frac))
+
+        train_end = max(0, n_train - buf)
+        val_start = min(n, n_train + buf)
+        val_end   = min(n, n_train + n_val - buf)
+        test_start = min(n, n_train + n_val + buf)
+
+        train_parts.append(sub.iloc[:train_end])
+        val_parts.append(sub.iloc[val_start:val_end])
+        test_parts.append(sub.iloc[test_start:])
+
+    train_df = pd.concat(train_parts, ignore_index=True) if train_parts else pd.DataFrame()
+    val_df   = pd.concat(val_parts,   ignore_index=True) if val_parts   else pd.DataFrame()
+    test_df  = pd.concat(test_parts,  ignore_index=True) if test_parts  else pd.DataFrame()
+
+    train_df, val_df  = _promote_rare_class_rows(train_df, val_df,
+                                                 min_per_class_per_split)
+    train_df, test_df = _promote_rare_class_rows(train_df, test_df,
+                                                 min_per_class_per_split)
+
+    paths = {
+        'train': os.path.join(out_dir, 'train.csv'),
+        'val':   os.path.join(out_dir, 'val.csv'),
+        'test':  os.path.join(out_dir, 'test.csv'),
+    }
+    train_df.to_csv(paths['train'], index=False)
+    val_df.to_csv(paths['val'], index=False)
+    test_df.to_csv(paths['test'], index=False)
+    print(f"Split (time-axis): train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
+    if 'session' in train_df:
+        print(f"Sessions appearing in all splits: {train_df['session'].nunique()}")
     return paths
 
 

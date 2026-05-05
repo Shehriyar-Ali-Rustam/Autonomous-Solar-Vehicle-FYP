@@ -58,6 +58,7 @@ class TrainConfig:
     test_ratio: float = 0.15
     val_ratio: float = 0.15
     oversample: bool = True
+    split_mode: str = 'time'   # 'time' | 'session'
 
 
 def set_seed(seed: int) -> None:
@@ -111,7 +112,8 @@ def train(cfg: TrainConfig) -> None:
     splits_dir = os.path.join(run_dir, 'splits')
     paths = split_csv(cfg.csv_path, splits_dir, seed=cfg.seed,
                       train_ratio=1.0 - cfg.test_ratio - cfg.val_ratio,
-                      val_ratio=cfg.val_ratio)
+                      val_ratio=cfg.val_ratio,
+                      mode=cfg.split_mode)
 
     train_ds = DrivingDataset(paths['train'], train=True)
     val_ds   = DrivingDataset(paths['val'],   train=False)
@@ -259,6 +261,9 @@ def main() -> None:
     p.add_argument('--epochs-unfrozen', type=int, default=cfg_yaml.get('epochs_unfrozen', 20))
     p.add_argument('--no-oversample', action='store_true',
                    help='Disable WeightedRandomSampler oversampling')
+    p.add_argument('--split-mode', choices=['time', 'session'], default='time',
+                   help='time = split each session along time axis (default); '
+                        'session = whole sessions per bucket (use only with >=5 sessions)')
     args = p.parse_args()
 
     cfg = TrainConfig(
@@ -276,6 +281,7 @@ def main() -> None:
         test_ratio=cfg_yaml.get('test_ratio', 0.15),
         val_ratio=cfg_yaml.get('val_ratio', 0.15),
         oversample=not args.no_oversample,
+        split_mode=args.split_mode,
     )
     train(cfg)
 

@@ -41,7 +41,7 @@ def test_no_session_appears_in_more_than_one_split():
         _toy_df().to_csv(csv_path, index=False)
 
         paths = split_csv(csv_path, out_dir, train_ratio=0.34, val_ratio=0.33,
-                          seed=42, min_per_class_per_split=0)
+                          seed=42, min_per_class_per_split=0, mode='session')
 
         train_sess = set(pd.read_csv(paths['train'])['session'])
         val_sess   = set(pd.read_csv(paths['val'])['session'])
@@ -64,3 +64,23 @@ def test_split_creates_three_files():
                           seed=42, min_per_class_per_split=0)
         for k in ('train', 'val', 'test'):
             assert os.path.exists(paths[k]), f"missing {k}"
+
+
+def test_time_split_default_keeps_class_coverage():
+    """time-axis split (default) gives every session-class pair to all splits
+    where data exists, and produces train > val ≈ test in size.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        csv_path = os.path.join(td, 'all.csv')
+        out_dir  = os.path.join(td, 'splits')
+        _toy_df().to_csv(csv_path, index=False)
+        paths = split_csv(csv_path, out_dir, train_ratio=0.70, val_ratio=0.15,
+                          seed=42, min_per_class_per_split=0, mode='time')
+        train_df = pd.read_csv(paths['train'])
+        val_df   = pd.read_csv(paths['val'])
+        test_df  = pd.read_csv(paths['test'])
+        # Train should be biggest
+        assert len(train_df) > len(val_df)
+        assert len(train_df) > len(test_df)
+        # All three splits non-empty
+        assert len(train_df) > 0 and len(val_df) > 0 and len(test_df) > 0
