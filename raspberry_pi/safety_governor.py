@@ -49,7 +49,8 @@ class SafetyGovernor:
 
     CRITICAL_FRONT_DISTANCE = 25.0     # cm - immediate stop
     CRITICAL_REAR_DISTANCE = 30.0      # cm - immediate stop when reversing
-    SENSOR_FAILURE_TIME = 3.0          # seconds of all-zeros before declaring failure
+    # Read from config so it can be tightened centrally (defaults to 1.0s)
+    SENSOR_FAILURE_TIME = getattr(config, 'SENSOR_FAILURE_TIME', 1.0)
 
     def __init__(self):
         self.last_valid_sensor_time = time.time()

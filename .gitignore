@@ -14,11 +14,21 @@ laptop/data/images/
 laptop/data/*.csv
 laptop/models/*.pt
 laptop/models/*.onnx
+laptop/models/v_*/
+laptop/models/latest
 laptop/models/tb_*/
 laptop/models/splits/
 laptop/models/*.png
 laptop/models/*.json
 laptop/logs/
+laptop/autonomous_logs/
+
+# pytest
+.pytest_cache/
+
+# Editor backups
+*~
+*.bak
 
 # OS
 .DS_Store

@@ -1,0 +1,65 @@
+# Central config for the laptop side. Magic numbers live here.
+# To override at runtime: --config path/to/another.yaml
+
+# ===== Network ===============================================================
+pi:
+  default_ip: "192.168.1.100"
+  port: 5555
+
+web:
+  port: 8080
+  bind: "0.0.0.0"
+
+# ===== Camera ================================================================
+camera:
+  device: 1            # default --camera arg value
+  width: 640
+  height: 480
+  fps: 30
+
+# ===== Recorder ==============================================================
+recorder:
+  sample_hz: 10        # samples per second
+  jpg_quality: 85
+  out_dir: "data"
+
+# ===== ML model + inference ==================================================
+model:
+  conf_threshold: 0.55      # below this → safety override → STOP
+  loop_hz: 10               # autonomous loop rate
+  pulse_steer_ms: 200       # how long LEFT/RIGHT stays active per tap (web UI)
+
+train:
+  batch_size: 32
+  epochs_frozen: 10
+  epochs_unfrozen: 20
+  lr_head: 0.001
+  lr_backbone: 0.0001
+  weight_decay: 0.0001
+  early_stop_patience: 6
+  seed: 42
+  test_ratio: 0.15
+  val_ratio: 0.15
+
+# ===== Sensor ranges =========================================================
+sensors:
+  max_distance_cm: 400.0    # HC-SR04 typical max
+  min_distance_cm: 2.0
+  max_speed_mps: 5.0
+
+# ===== Vision-based safety (laptop) =========================================
+pedestrian:
+  area_threshold: 0.06      # fraction of frame area → "close enough to stop"
+  any_position: true        # true = stop for person in any position
+                            # false = only stop for centre
+
+yolo:
+  conf_threshold: 0.4
+  staleness_seconds: 1.0    # if YOLO heartbeat older than this → treat as failed
+
+# ===== Logging ===============================================================
+logging:
+  level: "INFO"             # DEBUG | INFO | WARNING | ERROR
+  dir: "logs"               # rotating file logs go here
+  max_bytes: 5_000_000      # 5MB before rotation
+  backup_count: 5

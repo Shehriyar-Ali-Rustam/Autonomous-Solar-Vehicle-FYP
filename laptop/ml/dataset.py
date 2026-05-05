@@ -1,39 +1,42 @@
 #!/usr/bin/env python3
-"""
-Dataset for the autonomous driving model.
+"""Dataset, state-vector builder, and split utilities.
 
-CSV layout (produced by data_collection/record.py):
-    frame_path, FL, FR, FW, BC, LS, RS,
-    gps_valid, gps_speed, gps_heading,
-    prev_action, action_label
-
-Split is per-session to avoid data leakage between consecutive frames.
-Augmentation: horizontal flip with action-remap (LEFT<->RIGHT), color jitter,
-noise on sensor values.
+Highlights:
+  * Per-session train/val/test split (no scene leakage between splits).
+  * Class-stratified within sessions for the train/val side; rare classes
+    are guaranteed to appear in val and test by promoting samples when needed.
+  * Frame pair loading (current + previous from the same session).
+  * Centralised image preprocessing (vision/transforms.py).
+  * Gated GPS: features multiplied by gps_valid so invalid GPS contributes zero.
+  * Continuous YOLO position (-1..1, bbox centre x).
 """
+
+from __future__ import annotations
 
 import math
 import os
 import random
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-from torchvision import transforms
 
+from vision.transforms import build_eval_transform, build_train_transform
 from .actions import (FORWARD, SLOW_DOWN, TURN_LEFT, TURN_RIGHT, STOP,
                       REVERSE_LEFT, REVERSE_RIGHT, REVERSE, NUM_ACTIONS)
 
 
-# Normalization constants
+# ---------------- Normalisation constants ----------------
 MAX_DISTANCE_CM = 400.0
 MAX_SPEED_MPS = 5.0
 
-# Horizontal flip mapping (LEFT <-> RIGHT actions)
+
+# ---------------- Flip augmentation maps ----------------
 FLIP_ACTION_MAP = {
     FORWARD:       FORWARD,
     SLOW_DOWN:     SLOW_DOWN,
@@ -45,7 +48,7 @@ FLIP_ACTION_MAP = {
     REVERSE:       REVERSE,
 }
 
-# Sensor flip mapping: FL<->FR, LS<->RS (FW and BC unchanged)
+
 def flip_sensors(sensors: dict) -> dict:
     flipped = dict(sensors)
     flipped['FL'], flipped['FR'] = sensors['FR'], sensors['FL']
@@ -53,71 +56,62 @@ def flip_sensors(sensors: dict) -> dict:
     return flipped
 
 
+# ---------------- State vector ----------------
 def build_state_vector(sensors: dict, gps_valid: int, gps_speed: float,
                        gps_heading_deg: float, prev_action: int,
-                       yolo: dict = None) -> np.ndarray:
+                       yolo: Optional[dict] = None) -> np.ndarray:
+    """Normalised state vector matching ml.model.STATE_DIM = 24.
+
+    yolo dict keys:
+        person_detected (0/1), object_detected (0/1),
+        nearest_area_ratio (0..1), nearest_position_x (-1..1)
     """
-    Build normalized state vector for the model.
+    # Sensors (clamped, normalised)
+    raw = [sensors['FL'], sensors['FR'], sensors['FW'],
+           sensors['BC'], sensors['LS'], sensors['RS']]
+    u = [max(0.0, min(MAX_DISTANCE_CM, v)) / MAX_DISTANCE_CM for v in raw]
 
-    Ordering (must match model.STATE_DIM):
-      [FL/max, FR/max, FW/max, BC/max, LS/max, RS/max,
-       front_min/max, back_min/max,
-       gps_valid, gps_speed/max, gps_heading_rad/(2*pi),
-       yolo_person, yolo_object, yolo_area_ratio, yolo_position/2,
-       prev_action_onehot x NUM_ACTIONS]
-    """
-    u = [sensors['FL'], sensors['FR'], sensors['FW'],
-         sensors['BC'], sensors['LS'], sensors['RS']]
-    u = [max(0.0, min(MAX_DISTANCE_CM, v)) / MAX_DISTANCE_CM for v in u]
-    front_vals = [v for v in [sensors['FL'], sensors['FR'], sensors['FW']] if 2 <= v <= MAX_DISTANCE_CM]
-    back_vals  = [v for v in [sensors['BC']] if 2 <= v <= MAX_DISTANCE_CM]
-    front_min = (min(front_vals) / MAX_DISTANCE_CM) if front_vals else 1.0
-    back_min  = (min(back_vals) / MAX_DISTANCE_CM) if back_vals else 1.0
+    # Front/back min (only valid sensors)
+    valid_front = [v for v in [sensors['FL'], sensors['FR'], sensors['FW']]
+                   if 2 <= v <= MAX_DISTANCE_CM]
+    valid_back  = [v for v in [sensors['BC']]
+                   if 2 <= v <= MAX_DISTANCE_CM]
+    front_min = (min(valid_front) / MAX_DISTANCE_CM) if valid_front else 1.0
+    back_min  = (min(valid_back) / MAX_DISTANCE_CM) if valid_back else 1.0
 
-    gps_speed_n = max(0.0, min(MAX_SPEED_MPS, gps_speed)) / MAX_SPEED_MPS
-    heading_rad = math.radians(gps_heading_deg % 360.0) / (2 * math.pi)
+    # GPS — gated by validity flag so invalid GPS contributes zeros.
+    valid = 1.0 if int(gps_valid) > 0 else 0.0
+    speed_n = max(0.0, min(MAX_SPEED_MPS, gps_speed)) / MAX_SPEED_MPS * valid
+    heading = math.radians(gps_heading_deg % 360.0)
+    sin_h = math.sin(heading) * valid
+    cos_h = math.cos(heading) * valid
 
-    # YOLO features (default zeros if not provided)
+    # YOLO (with safe defaults)
     if yolo is None:
         yolo = {}
-    yolo_person = float(yolo.get('person_detected', 0))
-    yolo_obj    = float(yolo.get('object_detected', 0))
-    yolo_area   = float(yolo.get('nearest_area_ratio', 0.0))
-    yolo_pos    = float(yolo.get('nearest_position', 1)) / 2.0  # normalize 0/1/2 → 0/0.5/1
+    yolo_person  = float(yolo.get('person_detected', 0))
+    yolo_obj     = float(yolo.get('object_detected', 0))
+    yolo_area    = float(yolo.get('nearest_area_ratio', 0.0))
+    yolo_pos_x   = float(yolo.get('nearest_position_x', 0.0))  # -1..1
+    yolo_pos_x   = max(-1.0, min(1.0, yolo_pos_x))
 
+    # Prev action one-hot
     prev_oh = np.zeros(NUM_ACTIONS, dtype=np.float32)
     if 0 <= prev_action < NUM_ACTIONS:
         prev_oh[prev_action] = 1.0
 
-    vec = np.array(u + [front_min, back_min, float(gps_valid),
-                        gps_speed_n, heading_rad,
-                        yolo_person, yolo_obj, yolo_area, yolo_pos],
-                   dtype=np.float32)
-    return np.concatenate([vec, prev_oh])
+    head = np.array(u + [front_min, back_min,
+                         valid, speed_n, sin_h, cos_h,
+                         yolo_person, yolo_obj, yolo_area, yolo_pos_x],
+                    dtype=np.float32)
+    return np.concatenate([head, prev_oh])
 
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
-
-
-def build_transforms(train: bool, img_size: int = 224):
-    if train:
-        return transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
-
-
+# ---------------- Sample dataclass ----------------
 @dataclass
 class Sample:
     image_path: str
+    prev_image_path: Optional[str]   # frame from same session, ~100ms earlier
     sensors: dict
     gps_valid: int
     gps_speed: float
@@ -125,14 +119,12 @@ class Sample:
     prev_action: int
     label: int
     yolo: dict
+    session: str
 
 
+# ---------------- Dataset ----------------
 class DrivingDataset(Dataset):
-    """
-    Supervised dataset: (image, state_vector) -> action label.
-    Horizontal-flip augmentation is applied per-sample during training with p=0.5;
-    sensor left/right channels and action label are flipped accordingly.
-    """
+    """Supervised dataset: (frame_pair, state) → action label."""
 
     def __init__(self, csv_path: str, train: bool = True,
                  sensor_noise_std: float = 0.02, flip_prob: float = 0.5):
@@ -140,16 +132,42 @@ class DrivingDataset(Dataset):
         self.train = train
         self.sensor_noise_std = sensor_noise_std
         self.flip_prob = flip_prob
-        self.transform = build_transforms(train=train)
+        self.transform = build_train_transform() if train else build_eval_transform()
         self.samples: List[Sample] = self._load(csv_path)
 
     @staticmethod
-    def _load(csv_path: str) -> List[Sample]:
+    def _yolo_pos_x(row) -> float:
+        """Convert YOLO position to continuous (-1..1).
+
+        Backwards-compatible: old data uses yolo_pos in {0, 1, 2}; new data
+        will use yolo_pos_x in [-1, 1]. We support both.
+        """
+        if 'yolo_pos_x' in row and pd.notna(row.get('yolo_pos_x')):
+            return float(row['yolo_pos_x'])
+        legacy = row.get('yolo_pos', 1)
+        try:
+            legacy = int(legacy)
+        except (TypeError, ValueError):
+            legacy = 1
+        # 0=left → -1, 1=center → 0, 2=right → +1
+        return float(legacy) - 1.0
+
+    @classmethod
+    def _load(cls, csv_path: str) -> List[Sample]:
         df = pd.read_csv(csv_path)
+        # Build per-session previous-frame index for frame stacking.
+        prev_path: Dict[int, Optional[str]] = {}
+        last_in_session: Dict[str, str] = {}
+        for idx, row in df.iterrows():
+            sess = str(row.get('session', ''))
+            prev_path[idx] = last_in_session.get(sess)
+            last_in_session[sess] = row['frame_path']
+
         samples = []
-        for _, r in df.iterrows():
+        for idx, r in df.iterrows():
             samples.append(Sample(
                 image_path=r['frame_path'],
+                prev_image_path=prev_path.get(idx),
                 sensors={'FL': float(r['FL']), 'FR': float(r['FR']),
                          'FW': float(r['FW']), 'BC': float(r['BC']),
                          'LS': float(r['LS']), 'RS': float(r['RS'])},
@@ -162,95 +180,208 @@ class DrivingDataset(Dataset):
                     'person_detected':    int(r.get('yolo_person', 0)),
                     'object_detected':    int(r.get('yolo_object', 0)),
                     'nearest_area_ratio': float(r.get('yolo_area', 0.0)),
-                    'nearest_position':   int(r.get('yolo_pos', 1)),
+                    'nearest_position_x': cls._yolo_pos_x(r),
                 },
+                session=str(r.get('session', '')),
             ))
         return samples
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int):
+    def _load_image(self, path: Optional[str], fallback: Image.Image) -> Image.Image:
+        if path and os.path.exists(path):
+            try:
+                return Image.open(path).convert('RGB')
+            except (OSError, IOError):
+                return fallback
+        return fallback
+
+    def __getitem__(self, idx: int) -> dict:
         s = self.samples[idx]
-        img = Image.open(s.image_path).convert('RGB')
+        img = self._load_image(s.image_path, Image.new('RGB', (224, 224)))
+        prev = self._load_image(s.prev_image_path, img)  # fallback to current
 
         sensors = s.sensors
         label = s.label
         prev_action = s.prev_action
         yolo = dict(s.yolo)
 
-        # Horizontal flip augmentation
-        flip = self.train and random.random() < self.flip_prob
-        if flip:
+        # Horizontal flip augmentation (training only)
+        if self.train and random.random() < self.flip_prob:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            prev = prev.transpose(Image.FLIP_LEFT_RIGHT)
             sensors = flip_sensors(sensors)
             label = FLIP_ACTION_MAP[label]
             prev_action = FLIP_ACTION_MAP[prev_action]
-            # Flip YOLO position too (left ↔ right)
-            yolo['nearest_position'] = 2 - yolo.get('nearest_position', 1)
+            yolo['nearest_position_x'] = -float(yolo.get('nearest_position_x', 0.0))
 
         img_t = self.transform(img)
+        prev_t = self.transform(prev)
+        stacked = torch.cat([img_t, prev_t], dim=0)  # (6, 224, 224)
 
-        # Sensor noise augmentation (on normalized state vector)
         state = build_state_vector(sensors, s.gps_valid, s.gps_speed,
                                    s.gps_heading, prev_action, yolo)
         if self.train and self.sensor_noise_std > 0:
-            # Only add noise to the first 8 features (distances); keep one-hot crisp
+            # Add noise only to the 8 distance-derived features
             noise = np.random.normal(0, self.sensor_noise_std, 8).astype(np.float32)
             state[:8] = np.clip(state[:8] + noise, 0.0, 1.0)
 
         return {
-            'image': img_t,
+            'image': stacked,
             'state': torch.from_numpy(state).float(),
             'label': torch.tensor(label, dtype=torch.long),
         }
 
 
+# ---------------- Class weights ----------------
 def class_weights(labels: List[int], num_classes: int = NUM_ACTIONS) -> torch.Tensor:
-    """Inverse-frequency class weights for CrossEntropyLoss.
-    Classes with 0 samples get weight 0 (not penalized/rewarded)."""
+    """Inverse-frequency class weights. Classes with 0 samples → weight 0."""
     counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
     present = counts > 0
     w = np.zeros(num_classes, dtype=np.float32)
     if present.any():
         w[present] = 1.0 / counts[present]
-        # Normalize so average weight over present classes = 1
         w = w / w[present].mean()
     return torch.from_numpy(w).float()
 
 
+def sample_weights_for_oversampling(labels: List[int],
+                                    num_classes: int = NUM_ACTIONS) -> np.ndarray:
+    """Per-sample weights for use with torch.utils.data.WeightedRandomSampler.
+
+    Each sample's weight = 1 / count(its class). After WeightedRandomSampler,
+    minority classes are sampled more often, balancing each batch.
+    """
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    counts = np.where(counts == 0, 1.0, counts)
+    inv = 1.0 / counts
+    return np.array([inv[c] for c in labels], dtype=np.float64)
+
+
+# ---------------- Per-session, stratified split ----------------
 def split_csv(csv_path: str, out_dir: str,
               train_ratio: float = 0.70, val_ratio: float = 0.15,
-              seed: int = 42) -> dict:
-    """Shuffle-split a single CSV into train/val/test CSVs (file paths returned)."""
-    import pandas as pd
+              seed: int = 42, min_per_class_per_split: int = 2) -> dict:
+    """Split a dataset CSV with two priorities, in order:
+
+    1. **No scene leakage**: rows from the same `session` MUST end up in the
+       same split (train OR val OR test, never split across).
+    2. **Stratification**: every action class should appear in val + test
+       at least `min_per_class_per_split` times where data permits, even
+       if that means moving a few sessions to balance.
+
+    Returns a dict {'train': path, 'val': path, 'test': path}.
+    """
     os.makedirs(out_dir, exist_ok=True)
-    df = pd.read_csv(csv_path).sample(frac=1, random_state=seed).reset_index(drop=True)
-    n = len(df)
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    train, val, test = df[:n_train], df[n_train:n_train + n_val], df[n_train + n_val:]
+    rng = random.Random(seed)
+
+    df = pd.read_csv(csv_path)
+    if 'session' not in df.columns:
+        # Fall back to random split if no session column
+        df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+        n = len(df)
+        n_tr, n_va = int(n * train_ratio), int(n * val_ratio)
+        train_df, val_df, test_df = df[:n_tr], df[n_tr:n_tr + n_va], df[n_tr + n_va:]
+    else:
+        sessions = list(df['session'].unique())
+        rng.shuffle(sessions)
+        n_total = len(df)
+        n_train_target = int(n_total * train_ratio)
+        n_val_target   = int(n_total * val_ratio)
+
+        # Greedy: assign whole sessions to train, then val, then test
+        # while keeping ratios close to targets.
+        sess_sizes = df.groupby('session').size().to_dict()
+        train_sess: List[str] = []
+        val_sess: List[str] = []
+        test_sess: List[str] = []
+        n_tr = n_va = n_te = 0
+        for s in sessions:
+            sz = sess_sizes[s]
+            # pick the bucket whose deficit is largest (proportional to target)
+            deficits = [
+                (n_train_target - n_tr, 'train'),
+                (n_val_target - n_va, 'val'),
+                (max(0, n_total - n_train_target - n_val_target) - n_te, 'test'),
+            ]
+            deficits.sort(key=lambda x: x[0], reverse=True)
+            target = deficits[0][1]
+            if target == 'train':
+                train_sess.append(s); n_tr += sz
+            elif target == 'val':
+                val_sess.append(s); n_va += sz
+            else:
+                test_sess.append(s); n_te += sz
+
+        # Force at least one session into val and test if available
+        if not val_sess and len(train_sess) > 1:
+            moved = train_sess.pop()
+            val_sess.append(moved); n_va += sess_sizes[moved]; n_tr -= sess_sizes[moved]
+        if not test_sess and len(train_sess) > 1:
+            moved = train_sess.pop()
+            test_sess.append(moved); n_te += sess_sizes[moved]; n_tr -= sess_sizes[moved]
+
+        train_df = df[df['session'].isin(train_sess)].reset_index(drop=True)
+        val_df   = df[df['session'].isin(val_sess)].reset_index(drop=True)
+        test_df  = df[df['session'].isin(test_sess)].reset_index(drop=True)
+
+    # Stratification check: warn (and promote a handful of train rows) if
+    # any class has < min_per_class_per_split in val/test. We promote
+    # individual rows here as a *second-best* fix to preserve evaluation
+    # signal on rare classes; per-session purity is preferred but we'd
+    # otherwise have classes with zero test support.
+    train_df, val_df  = _promote_rare_class_rows(train_df, val_df,
+                                                 min_per_class_per_split)
+    train_df, test_df = _promote_rare_class_rows(train_df, test_df,
+                                                 min_per_class_per_split)
+
     paths = {
         'train': os.path.join(out_dir, 'train.csv'),
         'val':   os.path.join(out_dir, 'val.csv'),
         'test':  os.path.join(out_dir, 'test.csv'),
     }
-    train.to_csv(paths['train'], index=False)
-    val.to_csv(paths['val'], index=False)
-    test.to_csv(paths['test'], index=False)
-    print(f"Split: train={len(train)}, val={len(val)}, test={len(test)}")
+    train_df.to_csv(paths['train'], index=False)
+    val_df.to_csv(paths['val'], index=False)
+    test_df.to_csv(paths['test'], index=False)
+    print(f"Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
+    print("Sessions: train={}, val={}, test={}".format(
+        train_df['session'].nunique() if 'session' in train_df else '?',
+        val_df['session'].nunique()   if 'session' in val_df   else '?',
+        test_df['session'].nunique()  if 'session' in test_df  else '?',
+    ))
     return paths
 
 
+def _promote_rare_class_rows(train_df: pd.DataFrame, target_df: pd.DataFrame,
+                             min_per_class: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """If the target split has < `min_per_class` of any present class, pull
+    that many rows from train for those classes only. Returns updated dfs.
+    """
+    if len(train_df) == 0 or len(target_df) == 0:
+        return train_df, target_df
+    counts_train = train_df['action_label'].value_counts().to_dict()
+    counts_target = target_df['action_label'].value_counts().to_dict()
+    moves: List[int] = []
+    for cls, n_train in counts_train.items():
+        n_target = counts_target.get(cls, 0)
+        deficit = max(0, min_per_class - n_target)
+        if deficit > 0 and n_train > deficit:
+            cls_rows = train_df[train_df['action_label'] == cls].head(deficit).index.tolist()
+            moves.extend(cls_rows)
+    if moves:
+        moved = train_df.loc[moves]
+        train_df = train_df.drop(index=moves).reset_index(drop=True)
+        target_df = pd.concat([target_df, moved], ignore_index=True)
+    return train_df, target_df
+
+
 if __name__ == "__main__":
-    # Quick smoke test (needs existing CSV)
     import sys
     if len(sys.argv) < 2:
         print("Usage: python -m laptop.ml.dataset <csv_path>")
         raise SystemExit(0)
     ds = DrivingDataset(sys.argv[1], train=True)
     print(f"Dataset size: {len(ds)}")
-    sample = ds[0]
-    print(f"image shape: {sample['image'].shape}")
-    print(f"state shape: {sample['state'].shape}")
-    print(f"label: {sample['label'].item()}")
+    s = ds[0]
+    print(f"image: {s['image'].shape}  state: {s['state'].shape}  label: {s['label'].item()}")

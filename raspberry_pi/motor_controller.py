@@ -85,21 +85,36 @@ class MotorController:
             self._motor_stop()
 
     def _motor_forward(self, speed):
-        """Run motor forward at specified speed"""
+        """Run motor physically FORWARD at specified speed.
+
+        Honours config.MOTOR_INVERTED so callers can always pass semantic
+        FORWARD/BACKWARD without knowing the wiring. This is the single
+        source of truth for direction inversion.
+        """
         if speed == 0:
             self._motor_stop()
             return
 
-        self.pwm_left.ChangeDutyCycle(0)      # Ensure LPWM is off
-        self.pwm_right.ChangeDutyCycle(speed)  # Set RPWM for forward
+        if getattr(config, 'MOTOR_INVERTED', False):
+            # Wiring is reversed → activate LPWM to physically go forward
+            self.pwm_right.ChangeDutyCycle(0)
+            self.pwm_left.ChangeDutyCycle(speed)
+        else:
+            self.pwm_left.ChangeDutyCycle(0)
+            self.pwm_right.ChangeDutyCycle(speed)
 
     def _motor_backward(self, speed):
-        """Run motor backward at specified speed"""
+        """Run motor physically BACKWARD at specified speed (honours MOTOR_INVERTED)."""
         if speed == 0:
             self._motor_stop()
             return
 
-        self.pwm_right.ChangeDutyCycle(0)     # Ensure RPWM is off
+        if getattr(config, 'MOTOR_INVERTED', False):
+            # Wiring is reversed → activate RPWM to physically go backward
+            self.pwm_left.ChangeDutyCycle(0)
+            self.pwm_right.ChangeDutyCycle(speed)
+        else:
+            self.pwm_right.ChangeDutyCycle(0)     # Ensure RPWM is off
         self.pwm_left.ChangeDutyCycle(speed)   # Set LPWM for backward
 
     def _motor_stop(self):

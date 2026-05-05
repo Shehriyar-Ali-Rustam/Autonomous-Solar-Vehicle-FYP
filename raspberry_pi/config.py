@@ -13,6 +13,13 @@ MOTOR_R_EN = 18      # GPIO 18 (Physical pin 12) - Right Enable
 MOTOR_L_EN = 27      # GPIO 27 (Physical pin 13) - Left Enable
 PWM_FREQUENCY = 1000 # Hz
 
+# Set True if your motor is wired such that activating RPWM moves the car
+# physically backward (i.e. wiring is reversed). The motor controller swaps
+# RPWM/LPWM internally so callers ALWAYS use semantic FORWARD/BACKWARD.
+# This is the single source of truth for direction inversion — no other file
+# should compensate for wiring.
+MOTOR_INVERTED = True
+
 # ==============================================================================
 # GPIO Pin Configuration (IBT_2 Steering Motor Driver)
 # ==============================================================================
@@ -72,10 +79,12 @@ CONTROL_LOOP_INTERVAL = 1.0 / CONTROL_LOOP_HZ  # Loop interval in seconds
 # ==============================================================================
 # Safety Settings
 # ==============================================================================
-WATCHDOG_TIMEOUT = 2.0   # Seconds - stop motor if no command received
+WATCHDOG_TIMEOUT = 0.5   # Seconds - stop motor if no command received from laptop
+                         # At indoor speed ~30 cm/s, 0.5s = 15cm of "blind" travel.
 CONNECTION_TIMEOUT = 5.0 # Seconds - reconnect attempt interval
 MAX_SENSOR_DISTANCE = 400.0  # Maximum valid sensor reading (cm)
 MIN_SENSOR_DISTANCE = 2.0    # Minimum valid sensor reading (cm)
+SENSOR_FAILURE_TIME = 1.0    # Seconds of all-zero sensors before declaring failure
 
 # ==============================================================================
 # Sensor Configuration

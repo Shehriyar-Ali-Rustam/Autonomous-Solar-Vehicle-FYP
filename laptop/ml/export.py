@@ -9,17 +9,18 @@ Usage:
 import argparse
 import torch
 
-from .model import DecisionModel, STATE_DIM
+from .model import DecisionModel, STATE_DIM, IMAGE_CHANNELS
 
 
 def export(ckpt_path: str, out_path: str, opset: int = 17):
     device = 'cpu'
     model = DecisionModel(pretrained_backbone=False).to(device)
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt['model'])
+    sd = ckpt.get('model', ckpt) if isinstance(ckpt, dict) else ckpt
+    model.load_state_dict(sd)
     model.eval()
 
-    dummy_img   = torch.randn(1, 3, 224, 224)
+    dummy_img   = torch.randn(1, IMAGE_CHANNELS, 224, 224)
     dummy_state = torch.randn(1, STATE_DIM)
 
     torch.onnx.export(

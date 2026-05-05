@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""Action space for the decision model (single source of truth)."""
+"""Action space for the decision model (single source of truth).
 
-FORWARD = 0
-SLOW_DOWN = 1
-TURN_LEFT = 2
-TURN_RIGHT = 3
-STOP = 4
-REVERSE_LEFT = 5
+After the Pi-side fix, FORWARD/BACKWARD are SEMANTIC commands referring to
+the *physical* direction the car will move. The Pi's motor_controller honours
+config.MOTOR_INVERTED to handle wiring inversion at the hardware boundary.
+The laptop never compensates for wiring.
+"""
+
+# ===== Action IDs ============================================================
+FORWARD       = 0
+SLOW_DOWN     = 1
+TURN_LEFT     = 2
+TURN_RIGHT    = 3
+STOP          = 4
+REVERSE_LEFT  = 5
 REVERSE_RIGHT = 6
-REVERSE = 7
+REVERSE       = 7
 
 ACTION_NAMES = [
     "FORWARD", "SLOW_DOWN", "TURN_LEFT", "TURN_RIGHT",
@@ -16,65 +23,84 @@ ACTION_NAMES = [
 ]
 NUM_ACTIONS = len(ACTION_NAMES)
 
-# True if the car's motor wiring is reversed (so drive='BACKWARD' protocol cmd
-# makes the car physically go forward, and vice versa). Both labeling and
-# autonomous-mode command mapping account for this.
-DRIVE_INVERTED = True
+
+# ===== Action → Pi command (intent) ==========================================
+# Per-action speed defaults (only used by autonomous mode).
+_ACTION_SPEEDS = {
+    FORWARD:       60,
+    SLOW_DOWN:     30,
+    TURN_LEFT:     40,
+    TURN_RIGHT:    40,
+    STOP:          0,
+    REVERSE_LEFT:  35,
+    REVERSE_RIGHT: 35,
+    REVERSE:       35,
+}
+
+# Per-action drive + steer (semantic, no wiring compensation).
+_ACTION_DRIVE_STEER = {
+    FORWARD:       ('FORWARD',  'STEER_STOP'),
+    SLOW_DOWN:     ('FORWARD',  'STEER_STOP'),
+    TURN_LEFT:     ('FORWARD',  'LEFT'),
+    TURN_RIGHT:    ('FORWARD',  'RIGHT'),
+    STOP:          ('STOP',     'STEER_STOP'),
+    REVERSE_LEFT:  ('BACKWARD', 'LEFT'),
+    REVERSE_RIGHT: ('BACKWARD', 'RIGHT'),
+    REVERSE:       ('BACKWARD', 'STEER_STOP'),
+}
 
 
 def action_to_pi_command(action_id: int) -> dict:
-    """Map action id -> Pi TCP command dict (physical direction)."""
-    fwd_cmd = 'BACKWARD' if DRIVE_INVERTED else 'FORWARD'
-    rev_cmd = 'FORWARD' if DRIVE_INVERTED else 'BACKWARD'
-    m = {
-        FORWARD:       {'command': fwd_cmd, 'steer': 'STEER_STOP', 'speed': 60},
-        SLOW_DOWN:     {'command': fwd_cmd, 'steer': 'STEER_STOP', 'speed': 30},
-        TURN_LEFT:     {'command': fwd_cmd, 'steer': 'LEFT',       'speed': 40},
-        TURN_RIGHT:    {'command': fwd_cmd, 'steer': 'RIGHT',      'speed': 40},
-        STOP:          {'command': 'STOP',  'steer': 'STEER_STOP', 'speed': 0},
-        REVERSE_LEFT:  {'command': rev_cmd, 'steer': 'LEFT',       'speed': 35},
-        REVERSE_RIGHT: {'command': rev_cmd, 'steer': 'RIGHT',      'speed': 35},
-        REVERSE:       {'command': rev_cmd, 'steer': 'STEER_STOP', 'speed': 35},
-    }
-    return m.get(action_id, m[STOP])
+    """Map action id -> Pi TCP command dict."""
+    if action_id not in _ACTION_DRIVE_STEER:
+        action_id = STOP
+    drive, steer = _ACTION_DRIVE_STEER[action_id]
+    return {'command': drive, 'steer': steer, 'speed': _ACTION_SPEEDS[action_id]}
 
 
-SLOW_DOWN_SPEED_THRESHOLD = 35  # speed < this while moving forward → SLOW_DOWN
+# ===== Manual driving → action label =========================================
+# Speed below this threshold while moving forward → SLOW_DOWN label.
+SLOW_DOWN_SPEED_THRESHOLD = 35
+
+
+def _physical_direction(drive: str) -> str:
+    """Returns 'forward' | 'backward' | 'stop' for a semantic drive command."""
+    if drive == 'FORWARD':
+        return 'forward'
+    if drive == 'BACKWARD':
+        return 'backward'
+    return 'stop'
 
 
 def manual_to_action(drive: str, steer: str, speed: int = 50) -> int:
-    """Convert manual drive+steer -> action id (used when labeling training data).
-    Accounts for DRIVE_INVERTED: protocol drive='BACKWARD' = physical FORWARD.
+    """Convert manual drive+steer+speed → action id for training labels.
 
-    Intent-based labeling:
-        - STOP + steer=LEFT/RIGHT → TURN_LEFT/TURN_RIGHT (user wants to turn)
-        - Forward at low speed → SLOW_DOWN
+    Intent-based:
+      - STOP + steer LEFT/RIGHT → TURN_LEFT/TURN_RIGHT (user's turn intent)
+      - Forward at low speed → SLOW_DOWN
     """
-    # Determine physical direction
-    physical_forward = (drive == 'BACKWARD') if DRIVE_INVERTED else (drive == 'FORWARD')
-    physical_backward = (drive == 'FORWARD') if DRIVE_INVERTED else (drive == 'BACKWARD')
+    direction = _physical_direction(drive)
 
-    # STOP + steer captures turn intent
-    if drive == 'STOP':
+    # User pressed STOP but turned the wheel: capture that turn intent.
+    if direction == 'stop':
         if steer == 'LEFT':
             return TURN_LEFT
         if steer == 'RIGHT':
             return TURN_RIGHT
         return STOP
 
-    if physical_forward:
+    if direction == 'forward':
         if steer == 'LEFT':
             return TURN_LEFT
         if steer == 'RIGHT':
             return TURN_RIGHT
-        # Low speed forward = SLOW_DOWN
         if 0 < speed < SLOW_DOWN_SPEED_THRESHOLD:
             return SLOW_DOWN
         return FORWARD
-    if physical_backward:
-        if steer == 'LEFT':
-            return REVERSE_LEFT
-        if steer == 'RIGHT':
-            return REVERSE_RIGHT
-        return REVERSE
-    return STOP
+
+    # backward
+    if steer == 'LEFT':
+        return REVERSE_LEFT
+    if steer == 'RIGHT':
+        return REVERSE_RIGHT
+    return REVERSE
