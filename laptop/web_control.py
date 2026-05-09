@@ -437,6 +437,9 @@ body {
         <button id="btnLocate" title="Center on my phone's location" style="
             min-width:44px; padding:10px; border-radius:6px; border:2px solid #1e90ff;
             background:#0a3d62; color:#fff; font-size:18px; cursor:pointer;">📍</button>
+        <button id="btnFindCar" title="Center on car's GPS position" style="
+            min-width:44px; padding:10px; border-radius:6px; border:2px solid #0f0;
+            background:#103a10; color:#fff; font-size:18px; cursor:pointer;">🚗</button>
     </div>
 
     <!-- A / B selector — which point are you setting? -->
@@ -879,6 +882,16 @@ document.getElementById('btnUseCar').addEventListener('click', () => {
     setPointAB('A', p.lat(), p.lng());
 });
 
+// "Find the car" — centre the map on the car's current GPS position
+document.getElementById('btnFindCar').addEventListener('click', () => {
+    if (!carMarker) {
+        alert('No car GPS yet. Connect Pi, take car outdoors, wait 30-60s for fix.');
+        return;
+    }
+    gmap.panTo(carMarker.getPosition());
+    gmap.setZoom(19);
+});
+
 document.getElementById('btnNavGo').addEventListener('click', () => {
     if (!pointB) {
         alert('Set destination (B) first.');
@@ -916,14 +929,17 @@ function pollNav() {
             if (!carMarker) {
                 carMarker = new google.maps.Marker({
                     position: pos, map: gmap,
+                    label: {text: '🚗', fontSize: '20px'},
                     icon: {
                         path: google.maps.SymbolPath.CIRCLE,
-                        scale: 8, fillColor: '#1e90ff', fillOpacity: 1,
-                        strokeColor: '#fff', strokeWeight: 2,
+                        scale: 18, fillColor: '#FFD700', fillOpacity: 0.9,
+                        strokeColor: '#000', strokeWeight: 2,
                     },
-                    title: 'Car',
+                    zIndex: 1000,
+                    title: 'CAR',
                 });
                 gmap.setCenter(pos);
+                gmap.setZoom(19);
             } else {
                 carMarker.setPosition(pos);
             }
