@@ -422,6 +422,36 @@ body {
         <strong style="color:#0f0;">NAVIGATION</strong>
         <span id="navState" style="font-size:13px;color:#888;">--</span>
     </div>
+    <!-- Search input (Places Autocomplete) -->
+    <div style="display:flex; gap:6px; margin-bottom:6px;">
+        <input id="searchInput" type="text" placeholder="Search a place / type address" style="
+            flex:1; padding:10px; border-radius:6px; border:1px solid #1e90ff;
+            background:#0a1d2e; color:#fff; font-size:14px;">
+        <button id="btnLocate" title="Center on my phone's location" style="
+            min-width:44px; padding:10px; border-radius:6px; border:2px solid #1e90ff;
+            background:#0a3d62; color:#fff; font-size:18px; cursor:pointer;">📍</button>
+    </div>
+
+    <!-- A / B selector — which point are you setting? -->
+    <div style="display:flex; gap:6px; margin-bottom:6px;">
+        <button id="btnPickA" class="ab-btn active" data-ab="A" style="
+            flex:1; padding:8px; border-radius:6px; border:2px solid #0f0;
+            background:#103a10; color:#fff; font-weight:bold; cursor:pointer;">
+            A: Pickup
+        </button>
+        <button id="btnPickB" class="ab-btn" data-ab="B" style="
+            flex:1; padding:8px; border-radius:6px; border:2px solid #444;
+            background:#222; color:#888; font-weight:bold; cursor:pointer;">
+            B: Destination
+        </button>
+        <button id="btnUseCar" title="Use car's GPS as A" style="
+            min-width:44px; padding:8px; border-radius:6px; border:2px solid #1e90ff;
+            background:#0a3d62; color:#fff; font-size:13px; cursor:pointer;">🚗→A</button>
+    </div>
+    <div id="abState" style="font-size:11px; color:#888; margin-bottom:6px; text-align:center;">
+        Setting <b style="color:#0f0;">A (pickup)</b> — tap on map
+    </div>
+
     <div id="map" style="width:100%; height:300px; background:#000; border-radius:6px;"></div>
     <div style="display:flex; gap:6px; margin-top:8px;">
         <button id="btnNavGo" class="btn" style="flex:1; min-height:44px; font-size:14px;
@@ -430,7 +460,7 @@ body {
         <button id="btnNavClear" class="btn" style="flex:1; min-height:44px; font-size:13px;">CLEAR</button>
     </div>
     <div id="navInfo" style="font-size:12px; color:#888; text-align:center; margin-top:6px;">
-        Tap on map to set destination
+        Tap "A: Pickup" or "B: Destination", then tap map
     </div>
 </div>
 
@@ -612,14 +642,36 @@ setInterval(pollStatus, 300);
 // ===== Google Maps + Navigation =====
 let gmap = null;
 let carMarker = null;
-let destMarker = null;
+let userMarker = null;       // phone holder's location (HTML5 geolocation)
+let userAccCircle = null;    // accuracy circle around user marker
+let aMarker = null;          // A = pickup
+let bMarker = null;          // B = destination
 let routeLine = null;
 let trailLine = null;
 let trail = [];
-let pendingDest = null;     // staged but not yet GO'd
+let pointA = null;           // {lat, lng}
+let pointB = null;           // {lat, lng}
+let activeAB = 'A';          // which one the next tap sets
+let placesAutocomplete = null;
 
 const MAX_TRAIL_POINTS = 200;
 const POLL_NAV_MS = 500;
+
+function setActiveAB(which) {
+    activeAB = which;
+    document.querySelectorAll('.ab-btn').forEach(b => {
+        const isActive = b.dataset.ab === which;
+        b.style.borderColor = isActive ? '#0f0' : '#444';
+        b.style.background = isActive ? '#103a10' : '#222';
+        b.style.color = isActive ? '#fff' : '#888';
+    });
+    const label = (which === 'A') ? 'A (pickup)' : 'B (destination)';
+    const colour = (which === 'A') ? '#0f0' : '#f44';
+    document.getElementById('abState').innerHTML =
+        `Setting <b style="color:${colour};">${label}</b> — tap on map`;
+}
+document.getElementById('btnPickA').addEventListener('click', () => setActiveAB('A'));
+document.getElementById('btnPickB').addEventListener('click', () => setActiveAB('B'));
 
 function initMap() {
     // Default center: CUST Islamabad campus (replace with your area). The map
@@ -633,55 +685,175 @@ function initMap() {
         gestureHandling: 'greedy',  // single-finger pan/zoom on mobile
     });
 
-    // Tap → set destination
+    // Tap → set whichever point is currently active (A or B)
     gmap.addListener('click', e => {
         const lat = e.latLng.lat();
         const lng = e.latLng.lng();
-        setPendingDestination(lat, lng);
+        setPointAB(activeAB, lat, lng);
     });
+
+    // Places Autocomplete on the search box (only works if Places API is
+    // enabled in Google Cloud Console + libraries=places in the Maps URL).
+    if (google.maps.places && google.maps.places.Autocomplete) {
+        const input = document.getElementById('searchInput');
+        placesAutocomplete = new google.maps.places.Autocomplete(input, {
+            types: ['geocode', 'establishment'],
+            fields: ['geometry', 'name', 'formatted_address'],
+        });
+        placesAutocomplete.bindTo('bounds', gmap);
+        placesAutocomplete.addListener('place_changed', () => {
+            const place = placesAutocomplete.getPlace();
+            if (!place || !place.geometry || !place.geometry.location) return;
+            const lat = place.geometry.location.lat();
+            const lng = place.geometry.location.lng();
+            gmap.panTo({lat, lng});
+            gmap.setZoom(19);
+            setPointAB(activeAB, lat, lng);
+            input.value = place.name || place.formatted_address || '';
+        });
+    } else {
+        // Places library not loaded (Places API not enabled).
+        // Fallback: pressing Enter geocodes via the Maps Geocoder.
+        const input = document.getElementById('searchInput');
+        input.placeholder = 'Type address + Enter (Places API not enabled)';
+        input.addEventListener('keypress', e => {
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            const q = input.value.trim();
+            if (!q) return;
+            const geocoder = new google.maps.Geocoder();
+            geocoder.geocode({address: q}, (results, status) => {
+                if (status !== 'OK' || !results[0]) {
+                    alert('Could not find: ' + q);
+                    return;
+                }
+                const loc = results[0].geometry.location;
+                gmap.panTo(loc);
+                gmap.setZoom(19);
+                setPointAB(activeAB, loc.lat(), loc.lng());
+            });
+        });
+    }
 }
 
-function setPendingDestination(lat, lng) {
-    pendingDest = {lat: lat, lng: lng};
-    if (destMarker) destMarker.setMap(null);
-    destMarker = new google.maps.Marker({
-        position: {lat: lat, lng: lng}, map: gmap,
-        label: {text: 'B', color: '#fff'},
-    });
-    document.getElementById('navInfo').textContent =
-        `Destination: ${lat.toFixed(5)}, ${lng.toFixed(5)} — tap GO to start`;
-    // Stage with backend
-    fetch('/api/destination', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({lat: lat, lon: lng}),
-    });
-    // Optionally: ask Directions API for a route (the car still drives a
-    // straight bearing line; the route is just for visualisation).
-    drawDirectionsRoute(lat, lng);
+// HTML5 geolocation — phone's GPS / WiFi location of the *user* (not the car).
+function locateMe() {
+    if (!navigator.geolocation) {
+        alert('Geolocation not supported by browser.');
+        return;
+    }
+    document.getElementById('navInfo').textContent = 'Locating you…';
+    navigator.geolocation.getCurrentPosition(
+        pos => {
+            const lat = pos.coords.latitude;
+            const lng = pos.coords.longitude;
+            const acc = pos.coords.accuracy || 50;   // metres
+            if (gmap) {
+                gmap.panTo({lat, lng});
+                gmap.setZoom(19);
+                if (userMarker) userMarker.setMap(null);
+                if (userAccCircle) userAccCircle.setMap(null);
+                userMarker = new google.maps.Marker({
+                    position: {lat, lng}, map: gmap,
+                    icon: {
+                        path: google.maps.SymbolPath.CIRCLE,
+                        scale: 7, fillColor: '#4285F4', fillOpacity: 1,
+                        strokeColor: '#fff', strokeWeight: 2,
+                    },
+                    title: 'You',
+                });
+                userAccCircle = new google.maps.Circle({
+                    center: {lat, lng}, radius: acc,
+                    fillColor: '#4285F4', fillOpacity: 0.12,
+                    strokeColor: '#4285F4', strokeOpacity: 0.4, strokeWeight: 1,
+                    map: gmap,
+                });
+            }
+            document.getElementById('navInfo').textContent =
+                `Your location: ${lat.toFixed(5)}, ${lng.toFixed(5)} (±${acc.toFixed(0)}m)`;
+        },
+        err => {
+            alert('Could not locate you: ' + err.message);
+        },
+        {enableHighAccuracy: true, timeout: 10000, maximumAge: 5000}
+    );
+}
+document.getElementById('btnLocate').addEventListener('click', locateMe);
+
+function setPointAB(which, lat, lng) {
+    const pos = {lat: lat, lng: lng};
+    if (which === 'A') {
+        pointA = pos;
+        if (aMarker) aMarker.setMap(null);
+        aMarker = new google.maps.Marker({
+            position: pos, map: gmap,
+            label: {text: 'A', color: '#fff', fontWeight: 'bold'},
+            icon: {
+                path: google.maps.SymbolPath.CIRCLE,
+                scale: 16, fillColor: '#0a0', fillOpacity: 1,
+                strokeColor: '#fff', strokeWeight: 2,
+            },
+            title: 'Pickup (A)',
+        });
+        // After picking A, auto-switch to B
+        setActiveAB('B');
+    } else {
+        pointB = pos;
+        if (bMarker) bMarker.setMap(null);
+        bMarker = new google.maps.Marker({
+            position: pos, map: gmap,
+            label: {text: 'B', color: '#fff', fontWeight: 'bold'},
+            icon: {
+                path: google.maps.SymbolPath.CIRCLE,
+                scale: 16, fillColor: '#d00', fillOpacity: 1,
+                strokeColor: '#fff', strokeWeight: 2,
+            },
+            title: 'Destination (B)',
+        });
+    }
+    updateRouteAndStage();
 }
 
 let directionsService = null;
-function drawDirectionsRoute(destLat, destLng) {
-    if (!gmap || !carMarker) return;
+function updateRouteAndStage() {
+    // Stage waypoints with backend (A then B). The car drives them in order.
+    const wps = [];
+    if (pointA) wps.push({lat: pointA.lat, lon: pointA.lng});
+    if (pointB) wps.push({lat: pointB.lat, lon: pointB.lng});
+    if (wps.length > 0) {
+        fetch('/api/destination', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({waypoints: wps}),
+        });
+    }
+
+    // Visualise route (only if both A and B are set)
+    if (!pointA || !pointB) {
+        if (routeLine) { routeLine.setMap(null); routeLine = null; }
+        document.getElementById('navInfo').textContent =
+            (pointA && !pointB) ? 'A set. Now tap B (destination).' :
+            (pointB && !pointA) ? 'B set. Now tap A (pickup) or use 🚗→A.' :
+            'Tap "A: Pickup" or "B: Destination", then tap map';
+        return;
+    }
+    document.getElementById('navInfo').textContent =
+        `A → B set. Tap GO to drive.`;
+
     if (!directionsService) directionsService = new google.maps.DirectionsService();
-    const carPos = carMarker.getPosition();
     directionsService.route({
-        origin: {lat: carPos.lat(), lng: carPos.lng()},
-        destination: {lat: destLat, lng: destLng},
-        travelMode: 'WALKING',
+        origin: pointA, destination: pointB, travelMode: 'WALKING',
     }, (res, status) => {
+        if (routeLine) routeLine.setMap(null);
         if (status !== 'OK' || !res.routes || !res.routes[0]) {
-            // Fall back to a straight dashed line
-            if (routeLine) routeLine.setMap(null);
+            // Fall back to a straight line
             routeLine = new google.maps.Polyline({
-                path: [{lat: carPos.lat(), lng: carPos.lng()}, {lat: destLat, lng: destLng}],
-                geodesic: true, strokeColor: '#FF8800', strokeWeight: 3, strokeOpacity: 0.7,
-                map: gmap,
+                path: [pointA, pointB],
+                geodesic: true, strokeColor: '#FF8800',
+                strokeWeight: 3, strokeOpacity: 0.7, map: gmap,
             });
             return;
         }
-        if (routeLine) routeLine.setMap(null);
         routeLine = new google.maps.Polyline({
             path: res.routes[0].overview_path,
             strokeColor: '#FF8800', strokeWeight: 4, strokeOpacity: 0.8,
@@ -690,9 +862,19 @@ function drawDirectionsRoute(destLat, destLng) {
     });
 }
 
+// "Use car's GPS as A" button
+document.getElementById('btnUseCar').addEventListener('click', () => {
+    if (!carMarker) {
+        alert('No car GPS yet. Connect Pi and wait for fix.');
+        return;
+    }
+    const p = carMarker.getPosition();
+    setPointAB('A', p.lat(), p.lng());
+});
+
 document.getElementById('btnNavGo').addEventListener('click', () => {
-    if (!pendingDest) {
-        alert('Tap on the map to set a destination first.');
+    if (!pointB) {
+        alert('Set destination (B) first.');
         return;
     }
     fetch('/api/go', {method: 'POST'}).then(r => r.json()).then(d => {
@@ -705,11 +887,13 @@ document.getElementById('btnNavStop').addEventListener('click', () => {
     document.getElementById('navInfo').textContent = 'Navigation stopped.';
 });
 document.getElementById('btnNavClear').addEventListener('click', () => {
-    if (destMarker) { destMarker.setMap(null); destMarker = null; }
+    if (aMarker) { aMarker.setMap(null); aMarker = null; }
+    if (bMarker) { bMarker.setMap(null); bMarker = null; }
     if (routeLine) { routeLine.setMap(null); routeLine = null; }
-    pendingDest = null;
+    pointA = null; pointB = null;
+    setActiveAB('A');
     fetch('/api/stop', {method: 'POST'});
-    document.getElementById('navInfo').textContent = 'Tap on map to set destination';
+    document.getElementById('navInfo').textContent = 'Tap "A: Pickup" or "B: Destination", then tap map';
 });
 
 function pollNav() {
@@ -760,7 +944,7 @@ fetch('/api/maps_key').then(r => r.json()).then(d => {
         return;
     }
     const s = document.createElement('script');
-    s.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(d.key) + '&callback=initMap';
+    s.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(d.key) + '&libraries=places&callback=initMap';
     s.async = true; s.defer = true;
     document.head.appendChild(s);
 });
@@ -877,14 +1061,27 @@ def _set_nav_active(value: bool) -> None:
 @app.route('/api/status')
 def api_status():
     """Status payload for the mobile app + web map UI."""
-    if pi_client is None:
-        return jsonify(connected=False)
-    st = pi_client.get_status() or {}
-    g = st.get('gps') or {}
-    drive, steer, speed = pi_client.get_state_snapshot()
     with nav_lock:
         nav_state = nav.state
         wps = nav.waypoints
+
+    if pi_client is None:
+        return jsonify(
+            connected=False,
+            gps={'valid': False},
+            sent={'drive': 'STOP', 'steer': 'STEER_STOP', 'speed': 0},
+            sensors={},
+            nav={
+                'active': nav_active,
+                'state': nav_state,
+                'waypoints': [{'lat': lat, 'lon': lon} for lat, lon in wps],
+                'info': nav_last_info,
+            },
+            yolo=get_yolo_snapshot(),
+        )
+    st = pi_client.get_status() or {}
+    g = st.get('gps') or {}
+    drive, steer, speed = pi_client.get_state_snapshot()
     return jsonify(
         connected=pi_client.connected,
         gps={
@@ -1014,29 +1211,46 @@ def main() -> None:
     global pi_client, camera, recorder, yolo
 
     p = argparse.ArgumentParser()
-    p.add_argument('--pi', required=True)
+    p.add_argument('--pi', default=None,
+                   help='Pi IP address. Omit (or use --no-pi) to run map-UI-only.')
     p.add_argument('--port', type=int, default=CFG.get('web', {}).get('port', 8080))
     p.add_argument('--camera', type=int, default=CFG.get('camera', {}).get('device', 0))
     p.add_argument('--data-dir',
                    default=os.path.join(os.path.dirname(__file__),
                                         CFG.get('recorder', {}).get('out_dir', 'data')))
     p.add_argument('--no-yolo', action='store_true')
+    p.add_argument('--no-pi', action='store_true',
+                   help='Skip Pi connection (map-UI-only / dry-run mode).')
+    p.add_argument('--no-camera', action='store_true',
+                   help='Skip camera (useful if no webcam plugged in).')
+    p.add_argument('--https', action='store_true',
+                   help='Serve over HTTPS with a self-signed cert (required '
+                        'for the 📍 location button on phones — browsers '
+                        'block geolocation over plain HTTP).')
     args = p.parse_args()
 
     import signal
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    camera = Camera(device=args.camera)
-    if not camera.start():
-        log.error("Camera failed to start"); return
+    if args.no_camera:
+        log.info("[main] camera disabled by flag")
+    else:
+        camera = Camera(device=args.camera)
+        if not camera.start():
+            log.warning("Camera failed to start — continuing without camera")
+            camera = None
 
-    pi_client = PiClient(args.pi)
-    if not pi_client.connect():
-        log.error("Cannot connect to Pi")
-        camera.stop()
-        return
-    pi_client.start()
+    if args.no_pi or not args.pi:
+        log.info("[main] Pi connection disabled — map UI / API only mode")
+        pi_client = None
+    else:
+        pi_client = PiClient(args.pi)
+        if not pi_client.connect():
+            log.warning(f"Cannot connect to Pi @ {args.pi} — continuing without Pi")
+            pi_client = None
+        else:
+            pi_client.start()
 
     if YOLO_AVAILABLE and not args.no_yolo:
         try:
@@ -1068,15 +1282,25 @@ def main() -> None:
     log.info(f"  Existing samples: {recorder.samples_written}")
     log.info("=" * 55)
 
+    run_kwargs = dict(
+        host=CFG.get('web', {}).get('bind', '0.0.0.0'),
+        port=args.port, threaded=True, use_reloader=False,
+    )
+    if args.https:
+        # Self-signed cert generated on the fly. Browser will warn — accept.
+        # Required for the geolocation 📍 button on phones (HTTPS-only API).
+        run_kwargs['ssl_context'] = 'adhoc'
+        log.info(f"  HTTPS: ON (self-signed). Open: https://<laptop-ip>:{args.port}")
+        log.info("  Browser will warn about cert — accept it once.")
+
     try:
-        app.run(host=CFG.get('web', {}).get('bind', '0.0.0.0'),
-                port=args.port, threaded=True, use_reloader=False)
+        app.run(**run_kwargs)
     except KeyboardInterrupt:
         pass
     finally:
-        recorder.close()
-        pi_client.close()
-        camera.stop()
+        if recorder: recorder.close()
+        if pi_client: pi_client.close()
+        if camera: camera.stop()
         log.info("Stopped.")
 
 
