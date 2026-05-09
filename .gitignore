@@ -30,6 +30,10 @@ laptop/autonomous_logs/
 *~
 *.bak
 
+# Secrets — DO NOT commit
+laptop/secrets.yaml
+secrets.yaml
+
 # OS
 .DS_Store
 Thumbs.db

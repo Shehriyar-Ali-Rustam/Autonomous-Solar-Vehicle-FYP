@@ -48,7 +48,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def load_config(path: str = None) -> Dict[str, Any]:
-    """Load + cache config from YAML, merged onto defaults."""
+    """Load + cache config from YAML, merged onto defaults.
+    Also merges in laptop/secrets.yaml if present (gitignored)."""
     if path is None:
         # default: laptop/config.yaml relative to this file
         here = os.path.dirname(os.path.abspath(__file__))
@@ -65,10 +66,20 @@ def load_config(path: str = None) -> Dict[str, Any]:
                 with open(path, 'r') as f:
                     loaded = yaml.safe_load(f) or {}
             except ImportError:
-                # PyYAML not installed — return defaults
                 pass
             except Exception:
-                # malformed yaml — return defaults
+                pass
+
+        # Also merge secrets.yaml (gitignored) if present
+        secrets_path = os.path.normpath(os.path.join(
+            os.path.dirname(path), 'secrets.yaml'))
+        if os.path.exists(secrets_path):
+            try:
+                import yaml  # type: ignore
+                with open(secrets_path, 'r') as f:
+                    secrets_data = yaml.safe_load(f) or {}
+                loaded = _deep_merge(loaded, secrets_data)
+            except Exception:
                 pass
 
         merged = _deep_merge(_DEFAULTS, loaded)

@@ -38,9 +38,10 @@ def test_distant_person_does_not_stop():
 
 def test_obstacle_in_front_within_slow_zone_turns_to_clearer_side():
     # left clear (200), right wall (10) → should TURN_LEFT
-    action, reason = decide(_sensors(fw=70, ls=200, rs=10), _yolo())
+    # fw=60 is below the front_slow_cm threshold (70 by default)
+    action, reason = decide(_sensors(fw=60, ls=200, rs=10), _yolo())
     assert action == TURN_LEFT
-    action, reason = decide(_sensors(fw=70, ls=10, rs=200), _yolo())
+    action, reason = decide(_sensors(fw=60, ls=10, rs=200), _yolo())
     assert action == TURN_RIGHT
 
 
@@ -58,7 +59,7 @@ def test_pinned_front_and_back_blocked_is_stop():
 
 def test_narrow_corridor_just_slows_down():
     # Front getting close but no side clearance → SLOW_DOWN
-    action, reason = decide(_sensors(fw=70, ls=10, rs=10), _yolo())
+    action, reason = decide(_sensors(fw=60, ls=10, rs=10), _yolo())
     assert action == SLOW_DOWN
 
 

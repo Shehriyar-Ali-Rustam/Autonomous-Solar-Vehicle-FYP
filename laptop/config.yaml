@@ -61,8 +61,8 @@ yolo:
 # Used by autonomous_hybrid.py. No ML model required.
 hybrid:
   front_emergency_cm: 35    # any front sensor below this → reverse out
-  front_slow_cm: 90         # below this → turn toward clearer side / slow down
-  front_cruise_cm: 150      # at or above this → full forward
+  front_slow_cm: 70         # below this → turn toward clearer side / slow down
+  front_cruise_cm: 100      # at or above this → full forward (was 150 — too cautious)
   side_clear_cm: 40         # need at least this much side clearance to turn that way
   back_emergency_cm: 30     # block reverse when back sensor below this
 

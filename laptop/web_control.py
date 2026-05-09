@@ -28,7 +28,8 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from utils.logger import get_logger
 from utils.config import load_config
 from vision.camera import Camera
-from ml.actions import manual_to_action, ACTION_NAMES, STOP
+from ml.actions import manual_to_action, ACTION_NAMES, STOP, action_to_pi_command
+from nav.controller import NavController
 
 try:
     from vision.object_detector import ObjectDetector
@@ -51,6 +52,12 @@ latest_yolo = {'person_detected': 0, 'object_detected': 0,
                'nearest_area_ratio': 0.0, 'nearest_position_x': 0.0,
                'num_objects': 0}
 yolo_last_update = 0.0
+
+# Navigation
+nav = NavController()
+nav_lock = threading.Lock()
+nav_active = False               # True after user taps GO
+nav_last_info: dict = {}
 
 
 # ===== YOLO ===============================================================
@@ -409,6 +416,24 @@ body {
     YOLO: <span id="yoloStatus">--</span>
 </div>
 
+<!-- ===== GPS NAVIGATION MAP ===== -->
+<div id="navPanel" style="max-width:640px; margin:8px auto; padding:8px; background:#16213e; border-radius:8px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <strong style="color:#0f0;">NAVIGATION</strong>
+        <span id="navState" style="font-size:13px;color:#888;">--</span>
+    </div>
+    <div id="map" style="width:100%; height:300px; background:#000; border-radius:6px;"></div>
+    <div style="display:flex; gap:6px; margin-top:8px;">
+        <button id="btnNavGo" class="btn" style="flex:1; min-height:44px; font-size:14px;
+                background:#2d5016; border-color:#0f0;">GO</button>
+        <button id="btnNavStop" class="btn stop-btn" style="flex:1; min-height:44px; font-size:14px;">STOP NAV</button>
+        <button id="btnNavClear" class="btn" style="flex:1; min-height:44px; font-size:13px;">CLEAR</button>
+    </div>
+    <div id="navInfo" style="font-size:12px; color:#888; text-align:center; margin-top:6px;">
+        Tap on map to set destination
+    </div>
+</div>
+
 <div class="sensor-bar">
     <div class="sensor"><div class="label">Front-L</div><div class="value" id="sFL">--</div><div class="unit">cm</div></div>
     <div class="sensor"><div class="label">Front-W</div><div class="value" id="sFW">--</div><div class="unit">cm</div></div>
@@ -582,6 +607,163 @@ function pollStatus() {
     }).catch(() => {});
 }
 setInterval(pollStatus, 300);
+
+
+// ===== Google Maps + Navigation =====
+let gmap = null;
+let carMarker = null;
+let destMarker = null;
+let routeLine = null;
+let trailLine = null;
+let trail = [];
+let pendingDest = null;     // staged but not yet GO'd
+
+const MAX_TRAIL_POINTS = 200;
+const POLL_NAV_MS = 500;
+
+function initMap() {
+    // Default center: CUST Islamabad campus (replace with your area). The map
+    // will recenter on the car's first valid GPS fix.
+    const cust = {lat: 33.6520, lng: 73.1613};
+    gmap = new google.maps.Map(document.getElementById('map'), {
+        center: cust,
+        zoom: 18,
+        mapTypeId: 'satellite',
+        disableDefaultUI: false,
+        gestureHandling: 'greedy',  // single-finger pan/zoom on mobile
+    });
+
+    // Tap → set destination
+    gmap.addListener('click', e => {
+        const lat = e.latLng.lat();
+        const lng = e.latLng.lng();
+        setPendingDestination(lat, lng);
+    });
+}
+
+function setPendingDestination(lat, lng) {
+    pendingDest = {lat: lat, lng: lng};
+    if (destMarker) destMarker.setMap(null);
+    destMarker = new google.maps.Marker({
+        position: {lat: lat, lng: lng}, map: gmap,
+        label: {text: 'B', color: '#fff'},
+    });
+    document.getElementById('navInfo').textContent =
+        `Destination: ${lat.toFixed(5)}, ${lng.toFixed(5)} — tap GO to start`;
+    // Stage with backend
+    fetch('/api/destination', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({lat: lat, lon: lng}),
+    });
+    // Optionally: ask Directions API for a route (the car still drives a
+    // straight bearing line; the route is just for visualisation).
+    drawDirectionsRoute(lat, lng);
+}
+
+let directionsService = null;
+function drawDirectionsRoute(destLat, destLng) {
+    if (!gmap || !carMarker) return;
+    if (!directionsService) directionsService = new google.maps.DirectionsService();
+    const carPos = carMarker.getPosition();
+    directionsService.route({
+        origin: {lat: carPos.lat(), lng: carPos.lng()},
+        destination: {lat: destLat, lng: destLng},
+        travelMode: 'WALKING',
+    }, (res, status) => {
+        if (status !== 'OK' || !res.routes || !res.routes[0]) {
+            // Fall back to a straight dashed line
+            if (routeLine) routeLine.setMap(null);
+            routeLine = new google.maps.Polyline({
+                path: [{lat: carPos.lat(), lng: carPos.lng()}, {lat: destLat, lng: destLng}],
+                geodesic: true, strokeColor: '#FF8800', strokeWeight: 3, strokeOpacity: 0.7,
+                map: gmap,
+            });
+            return;
+        }
+        if (routeLine) routeLine.setMap(null);
+        routeLine = new google.maps.Polyline({
+            path: res.routes[0].overview_path,
+            strokeColor: '#FF8800', strokeWeight: 4, strokeOpacity: 0.8,
+            map: gmap,
+        });
+    });
+}
+
+document.getElementById('btnNavGo').addEventListener('click', () => {
+    if (!pendingDest) {
+        alert('Tap on the map to set a destination first.');
+        return;
+    }
+    fetch('/api/go', {method: 'POST'}).then(r => r.json()).then(d => {
+        document.getElementById('navInfo').textContent =
+            d.ok ? 'Navigation started.' : ('Failed: ' + (d.error || 'unknown'));
+    });
+});
+document.getElementById('btnNavStop').addEventListener('click', () => {
+    fetch('/api/stop', {method: 'POST'});
+    document.getElementById('navInfo').textContent = 'Navigation stopped.';
+});
+document.getElementById('btnNavClear').addEventListener('click', () => {
+    if (destMarker) { destMarker.setMap(null); destMarker = null; }
+    if (routeLine) { routeLine.setMap(null); routeLine = null; }
+    pendingDest = null;
+    fetch('/api/stop', {method: 'POST'});
+    document.getElementById('navInfo').textContent = 'Tap on map to set destination';
+});
+
+function pollNav() {
+    fetch('/api/status').then(r => r.json()).then(s => {
+        const navState = (s.nav && s.nav.state) || '--';
+        document.getElementById('navState').textContent = navState;
+        if (s.nav && s.nav.info && s.nav.info.dist_m !== undefined) {
+            document.getElementById('navInfo').textContent =
+                `${navState}: ${s.nav.info.dist_m.toFixed(1)}m to target  err=${(s.nav.info.err_deg || 0).toFixed(0)}°`;
+        }
+        if (gmap && s.gps && s.gps.valid && s.gps.lat != null) {
+            const pos = {lat: s.gps.lat, lng: s.gps.lon};
+            if (!carMarker) {
+                carMarker = new google.maps.Marker({
+                    position: pos, map: gmap,
+                    icon: {
+                        path: google.maps.SymbolPath.CIRCLE,
+                        scale: 8, fillColor: '#1e90ff', fillOpacity: 1,
+                        strokeColor: '#fff', strokeWeight: 2,
+                    },
+                    title: 'Car',
+                });
+                gmap.setCenter(pos);
+            } else {
+                carMarker.setPosition(pos);
+            }
+            // Append to trail
+            trail.push(pos);
+            if (trail.length > MAX_TRAIL_POINTS) trail.shift();
+            if (trailLine) {
+                trailLine.setPath(trail);
+            } else {
+                trailLine = new google.maps.Polyline({
+                    path: trail, strokeColor: '#00ff00',
+                    strokeWeight: 3, strokeOpacity: 0.8, map: gmap,
+                });
+            }
+        }
+    }).catch(() => {});
+}
+setInterval(pollNav, POLL_NAV_MS);
+
+// Load Google Maps after fetching the API key
+fetch('/api/maps_key').then(r => r.json()).then(d => {
+    if (!d.key) {
+        document.getElementById('navInfo').textContent =
+            'No Google Maps key configured (laptop/secrets.yaml).';
+        return;
+    }
+    const s = document.createElement('script');
+    s.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(d.key) + '&callback=initMap';
+    s.async = true; s.defer = true;
+    document.head.appendChild(s);
+});
 </script>
 </body>
 </html>
@@ -627,6 +809,159 @@ def status():
         dropped=recorder.dropped_rows if recorder else 0,
         yolo=get_yolo_snapshot(),
     )
+
+
+# ===== Navigation API ======================================================
+def _gps_position() -> Optional[tuple]:
+    """Returns (lat, lon) from latest Pi status, or None if no fix."""
+    if pi_client is None:
+        return None
+    st = pi_client.get_status() or {}
+    g = st.get('gps') or {}
+    if int(g.get('valid', 0)) != 1:
+        return None
+    lat = g.get('lat')
+    lon = g.get('lon')
+    if lat is None or lon is None:
+        return None
+    return (float(lat), float(lon))
+
+
+def _gps_heading() -> Optional[float]:
+    if pi_client is None:
+        return None
+    st = pi_client.get_status() or {}
+    g = st.get('gps') or {}
+    if int(g.get('valid', 0)) != 1:
+        return None
+    h = g.get('heading_deg')
+    speed = float(g.get('speed_mps', 0))
+    # GPS heading is unreliable below ~1 m/s — discard
+    if h is None or speed < 1.0:
+        return None
+    return float(h)
+
+
+def nav_loop() -> None:
+    """Background thread: ticks the nav controller and sends actions to Pi."""
+    global nav_last_info
+    while True:
+        try:
+            if not nav_active or pi_client is None:
+                time.sleep(0.2)
+                continue
+            pos = _gps_position()
+            head = _gps_heading()
+            with nav_lock:
+                action_id, state, info = nav.tick(pos, head)
+            nav_last_info = {'state': state, **info}
+            if state == 'ARRIVED':
+                pi_client.safe_stop()
+                _set_nav_active(False)
+                log.info(f"[NAV] ARRIVED  info={info}")
+                time.sleep(0.5)
+                continue
+            cmd = action_to_pi_command(action_id)
+            pi_client.set_command(
+                drive=cmd['command'], steer=cmd['steer'], speed=cmd['speed'])
+        except Exception as e:
+            log.warning(f"nav_loop iteration failed: {e}")
+        time.sleep(0.2)
+
+
+def _set_nav_active(value: bool) -> None:
+    global nav_active
+    nav_active = value
+
+
+@app.route('/api/status')
+def api_status():
+    """Status payload for the mobile app + web map UI."""
+    if pi_client is None:
+        return jsonify(connected=False)
+    st = pi_client.get_status() or {}
+    g = st.get('gps') or {}
+    drive, steer, speed = pi_client.get_state_snapshot()
+    with nav_lock:
+        nav_state = nav.state
+        wps = nav.waypoints
+    return jsonify(
+        connected=pi_client.connected,
+        gps={
+            'valid': int(g.get('valid', 0)) == 1,
+            'lat': g.get('lat'),
+            'lon': g.get('lon'),
+            'heading_deg': g.get('heading_deg'),
+            'speed_mps': g.get('speed_mps'),
+            'satellites': g.get('satellites'),
+        },
+        sent={'drive': drive, 'steer': steer, 'speed': speed},
+        sensors=st.get('distances', {}),
+        nav={
+            'active': nav_active,
+            'state': nav_state,
+            'waypoints': [{'lat': lat, 'lon': lon} for lat, lon in wps],
+            'info': nav_last_info,
+        },
+        yolo=get_yolo_snapshot(),
+        recording=recorder.is_recording() if recorder else False,
+        samples=recorder.samples_written if recorder else 0,
+    )
+
+
+@app.route('/api/destination', methods=['POST'])
+def api_destination():
+    """Set a single destination. Body JSON: {lat, lon} OR {waypoints: [{lat,lon}, ...]}.
+    Calling this only stages the destination; you must also call /api/go to start moving."""
+    data = request.get_json(silent=True) or request.args
+    waypoints: list = []
+    if 'waypoints' in data and isinstance(data['waypoints'], list):
+        for w in data['waypoints']:
+            try:
+                waypoints.append((float(w['lat']), float(w['lon'])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    elif 'lat' in data and 'lon' in data:
+        waypoints = [(float(data['lat']), float(data['lon']))]
+    if not waypoints:
+        return jsonify(ok=False, error='no valid waypoints'), 400
+    with nav_lock:
+        nav.set_waypoints(waypoints)
+    log.info(f"[NAV] {len(waypoints)} waypoint(s) staged. Call /api/go to start.")
+    return jsonify(ok=True, waypoints=len(waypoints))
+
+
+@app.route('/api/go', methods=['POST'])
+def api_go():
+    """Start navigation toward the staged destination."""
+    with nav_lock:
+        if not nav.waypoints:
+            return jsonify(ok=False, error='no destination set'), 400
+    _set_nav_active(True)
+    log.info("[NAV] GO")
+    return jsonify(ok=True)
+
+
+@app.route('/api/stop', methods=['POST'])
+def api_stop():
+    """Stop navigation + safe_stop motors."""
+    _set_nav_active(False)
+    with nav_lock:
+        nav.stop()
+    if pi_client is not None:
+        pi_client.safe_stop()
+    log.info("[NAV] STOP")
+    return jsonify(ok=True)
+
+
+@app.route('/api/maps_key')
+def api_maps_key():
+    """Returns the Google Maps API key for the front-end. Restrict the key
+    in Google Cloud Console to your laptop IP — this isn't a secret, it's
+    OK to expose to the page that uses it. NEVER commit the key to git
+    (it lives in laptop/secrets.yaml which is gitignored)."""
+    key = CFG.get('google', {}).get('maps_api_key', '')
+    return jsonify(key=key)
 
 
 @app.route('/record/toggle')
@@ -718,6 +1053,9 @@ def main() -> None:
 
     recorder = DataRecorder(args.data_dir)
     threading.Thread(target=recorder.record_loop, daemon=True).start()
+
+    # Navigation control loop
+    threading.Thread(target=nav_loop, daemon=True).start()
 
     log.info("=" * 55)
     log.info("  WEB VEHICLE CONTROL + RECORDER + YOLO")

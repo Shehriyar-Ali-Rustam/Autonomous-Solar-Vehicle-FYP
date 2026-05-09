@@ -26,15 +26,16 @@ NUM_ACTIONS = len(ACTION_NAMES)
 
 # ===== Action → Pi command (intent) ==========================================
 # Per-action speed defaults (only used by autonomous mode).
+# NOTE: minimum motor PWM to actually move this car is ~40 (lower stalls).
 _ACTION_SPEEDS = {
-    FORWARD:       60,
-    SLOW_DOWN:     30,
-    TURN_LEFT:     40,
-    TURN_RIGHT:    40,
+    FORWARD:       70,
+    SLOW_DOWN:     45,
+    TURN_LEFT:     50,
+    TURN_RIGHT:    50,
     STOP:          0,
-    REVERSE_LEFT:  35,
-    REVERSE_RIGHT: 35,
-    REVERSE:       35,
+    REVERSE_LEFT:  45,
+    REVERSE_RIGHT: 45,
+    REVERSE:       45,
 }
 
 # Per-action drive + steer (semantic, no wiring compensation).
