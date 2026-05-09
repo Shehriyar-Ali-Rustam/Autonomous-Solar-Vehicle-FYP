@@ -28,8 +28,15 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from utils.logger import get_logger
 from utils.config import load_config
 from vision.camera import Camera
-from ml.actions import manual_to_action, ACTION_NAMES, STOP, action_to_pi_command
+from ml.actions import (manual_to_action, ACTION_NAMES, STOP, FORWARD,
+                         REVERSE, REVERSE_LEFT, REVERSE_RIGHT,
+                         action_to_pi_command)
 from nav.controller import NavController
+# The hybrid decide() function chooses an action from sensors+YOLO.
+# We use it as a SAFETY OVERRIDE for nav: if it returns STOP / REVERSE_* the
+# nav action is replaced (a hazard was detected). Otherwise we keep the nav
+# action so the car still steers toward its waypoint.
+from autonomous_hybrid import decide as hybrid_decide
 
 try:
     from vision.object_detector import ObjectDetector
@@ -1026,28 +1033,72 @@ def _gps_heading() -> Optional[float]:
     return float(h)
 
 
+def _apply_obstacle_override(nav_action: int, sensors: dict, yolo: dict
+                             ) -> tuple:
+    """Run the hybrid sensor+YOLO check on top of a nav-chosen action.
+
+    Returns (final_action_id, override_reason).
+    Policy:
+      * If hybrid says STOP (person close, pinned, etc) → STOP
+      * If hybrid says REVERSE_* (front emergency, need to back out) → REVERSE_*
+      * Otherwise → keep the nav action (the navigation steers toward the
+        target; the hybrid would only "slow down or turn" which would
+        contradict the chosen heading)
+    """
+    if not sensors:
+        return nav_action, ''
+    h_action, h_reason = hybrid_decide(sensors, yolo)
+    if h_action == STOP:
+        return STOP, f"OBST_STOP {h_reason}"
+    if h_action in (REVERSE, REVERSE_LEFT, REVERSE_RIGHT):
+        return h_action, f"OBST_REVERSE {h_reason}"
+    return nav_action, ''
+
+
 def nav_loop() -> None:
-    """Background thread: ticks the nav controller and sends actions to Pi."""
+    """Background thread: ticks the nav controller, applies obstacle override,
+    sends final action to Pi.
+    """
     global nav_last_info
     while True:
         try:
             if not nav_active or pi_client is None:
                 time.sleep(0.2)
                 continue
+
             pos = _gps_position()
             head = _gps_heading()
             with nav_lock:
                 action_id, state, info = nav.tick(pos, head)
-            nav_last_info = {'state': state, **info}
+
             if state == 'ARRIVED':
                 pi_client.safe_stop()
                 _set_nav_active(False)
+                nav_last_info = {'state': state, **info}
                 log.info(f"[NAV] ARRIVED  info={info}")
                 time.sleep(0.5)
                 continue
-            cmd = action_to_pi_command(action_id)
+
+            # Pull current sensors + YOLO snapshot for the obstacle override.
+            pi_status = pi_client.get_status() or {}
+            sensors = pi_status.get('distances', {})
+            yolo_snap = get_yolo_snapshot()
+
+            final_action, reason = _apply_obstacle_override(
+                action_id, sensors, yolo_snap)
+
+            cmd = action_to_pi_command(final_action)
             pi_client.set_command(
                 drive=cmd['command'], steer=cmd['steer'], speed=cmd['speed'])
+
+            # Expose both the nav-chosen and the overridden action for the UI
+            nav_last_info = {
+                'state': state,
+                **info,
+                'nav_action': ACTION_NAMES[action_id],
+                'final_action': ACTION_NAMES[final_action],
+                'override_reason': reason,
+            }
         except Exception as e:
             log.warning(f"nav_loop iteration failed: {e}")
         time.sleep(0.2)

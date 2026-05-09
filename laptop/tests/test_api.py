@@ -204,3 +204,52 @@ def test_full_a_to_b_flow(client):
     assert j['nav']['active'] is False
     assert j['nav']['state'] == 'IDLE'
     assert j['nav']['waypoints'] == []
+
+
+# ============== Obstacle override during navigation =====================
+def test_obstacle_override_stops_for_close_person(client):
+    from ml.actions import FORWARD, STOP
+    sensors = {'FL': 200, 'FR': 200, 'FW': 200,
+               'BC': 200, 'LS': 200, 'RS': 200}
+    yolo = {'person_detected': 1, 'object_detected': 0,
+            'nearest_area_ratio': 0.5, 'nearest_position_x': 0.0,
+            'num_objects': 1}
+    final, reason = wc._apply_obstacle_override(FORWARD, sensors, yolo)
+    assert final == STOP
+    assert 'OBST_STOP' in reason
+
+
+def test_obstacle_override_passes_through_when_clear(client):
+    from ml.actions import FORWARD
+    sensors = {'FL': 300, 'FR': 300, 'FW': 300,
+               'BC': 300, 'LS': 300, 'RS': 300}
+    yolo = {'person_detected': 0, 'object_detected': 0,
+            'nearest_area_ratio': 0.0, 'nearest_position_x': 0.0,
+            'num_objects': 0}
+    final, reason = wc._apply_obstacle_override(FORWARD, sensors, yolo)
+    assert final == FORWARD
+    assert reason == ''
+
+
+def test_obstacle_override_reverses_when_front_blocked(client):
+    """Front emergency triggers hybrid REVERSE → override should respect it."""
+    from ml.actions import FORWARD, REVERSE, REVERSE_LEFT, REVERSE_RIGHT
+    sensors = {'FL': 20, 'FR': 20, 'FW': 20,
+               'BC': 200, 'LS': 100, 'RS': 100}
+    yolo = {'person_detected': 0, 'object_detected': 0,
+            'nearest_area_ratio': 0.0, 'nearest_position_x': 0.0,
+            'num_objects': 0}
+    final, reason = wc._apply_obstacle_override(FORWARD, sensors, yolo)
+    assert final in (REVERSE, REVERSE_LEFT, REVERSE_RIGHT)
+    assert 'OBST_REVERSE' in reason
+
+
+def test_obstacle_override_handles_empty_sensors(client):
+    """No sensor data yet → don't override, let nav action through."""
+    from ml.actions import FORWARD
+    yolo = {'person_detected': 0, 'object_detected': 0,
+            'nearest_area_ratio': 0.0, 'nearest_position_x': 0.0,
+            'num_objects': 0}
+    final, reason = wc._apply_obstacle_override(FORWARD, {}, yolo)
+    assert final == FORWARD
+    assert reason == ''
